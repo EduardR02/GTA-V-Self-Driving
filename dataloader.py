@@ -59,7 +59,7 @@ class H5Dataset(Dataset):
         self.train_transform_with_zoom = A.Compose([
             A.Affine(scale=(1.05, 1.2), p=self.zoom_prob),
             color_jitter_replace,
-            RandomSkyMask(height_limit=(0.3, 0.4), p=0.5),
+            RandomSkyMask(height_limit=(0.3, 0.4), p=0.75),
         ], additional_targets=additional_targets)
 
     def _create_lookup_table(self):
@@ -321,7 +321,7 @@ additional_targets = {f'image{i}': 'image' for i in range(1, config.sequence_len
 
 train_transform_no_zoom = A.Compose([
     color_jitter_replace,
-    RandomSkyMask(height_limit=(0.3, 0.4), p=0.5),
+    RandomSkyMask(height_limit=(0.3, 0.4), p=0.75),
 ], additional_targets=additional_targets)
 
 

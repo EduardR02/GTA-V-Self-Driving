@@ -30,21 +30,22 @@ eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 fine_tune = False   # train the entire model or just the top
 freeze_non_dino_layers = False
-init_from = 'resume' # 'scratch' or 'resume'
+init_from = 'scratch' # 'scratch' or 'resume'
 dino_size = "base"  # small is ~21M, base ~86M, large ~300M, giant ~1.1B
 use_dino_registers = True
-load_checkpoint_name = "temp.pt"
-save_checkpoint_name = "temp.pt"
-metrics_name = "temp.png"
-gradient_accumulation_steps = 1 # used to simulate larger batch sizes
-batch_size = 24    # if gradient_accumulation_steps > 1, this is the micro-batch size
+load_checkpoint_name = "optim_64.pt"
+save_checkpoint_name = "optim_64.pt"
+metrics_name = "optim_64.png"
+gradient_accumulation_steps = 4 # used to simulate larger batch sizes
+batch_size = 64    # if gradient_accumulation_steps > 1, this is the micro-batch size
 train_split = 0.95   # test val split, keep same for resume
 convert_to_greyscale = False
 sequence_len = 3
 sequence_stride = 20
-flip_prob = 0.4
-warp_prob = 0.05
-zoom_prob = 0.2
+flip_prob = 0.25
+warp_prob = 0.2
+zoom_prob = 0.3
+dropout_p = 0.2     # 0 to disable
 classifier_type = "bce" # "cce" or "bce"
 restart_schedules = False
 cls_option = "both"    # "cls_only", "both", or "patches_only"
@@ -69,13 +70,20 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 # change this to bf16 if your gpu actually supports it
 dtype = 'float16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-compile = False # use PyTorch 2.0 to compile the model to be faster
+compile = True # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 config_dict = {k: globals()[k] for k in config_keys} # will be useful for logging
-
-
+num_workers = 1
 os.makedirs(out_dir, exist_ok=True)
+train_dataloader, val_dataloader = None, None
+if classifier_type == "bce":
+    id2label = {0: "w", 1: "a", 2: "s", 3: "d"}
+else:
+    id2label = config.outputs
+
+
+
 torch.manual_seed(1337)
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
@@ -83,18 +91,15 @@ device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.aut
 # note: float16 data type will automatically use a GradScaler
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
-num_workers = 1
-
-if classifier_type == "bce":
-    id2label = {0: "w", 1: "a", 2: "s", 3: "d"}
-else:
-    id2label = config.outputs
 
 
-train_dataloader = get_dataloader(current_data_dirs, batch_size, train_split, True, classifier_type,
-                                  sequence_len, sequence_stride, flip_prob, warp_prob, zoom_prob, shift_labels=shift_labels, shuffle=True, num_workers=num_workers)
-val_dataloader = get_dataloader(current_data_dirs, batch_size, train_split, False, classifier_type,
-                                sequence_len, sequence_stride, flip_prob, warp_prob, zoom_prob, shift_labels=shift_labels, shuffle=True, num_workers=num_workers)
+def init_dataloaders():
+    # put this in a function to not load it when inference script imports from here
+    global train_dataloader, val_dataloader
+    train_dataloader = get_dataloader(current_data_dirs, batch_size, train_split, True, classifier_type,
+                                    sequence_len, sequence_stride, flip_prob, warp_prob, zoom_prob, shift_labels=shift_labels, shuffle=True, num_workers=num_workers)
+    val_dataloader = get_dataloader(current_data_dirs, batch_size, train_split, False, classifier_type,
+                                    sequence_len, sequence_stride, flip_prob, warp_prob, zoom_prob, shift_labels=shift_labels, shuffle=True, num_workers=num_workers)
 
 
 iter_num = 0
@@ -103,19 +108,67 @@ iter_num_on_load = 0
 model = optimizer = scaler = None
 
 
+# claude wrote a quick check to see if there are any conversion issues, after taking a look i decided to inference in fp16 for 60% more fps
+def check_fp16_conversion_issues(model):
+    # Save original FP32 model parameters
+    fp32_params = {name: param.clone().detach().cpu() for name, param in model.named_parameters()}
+    
+    # Convert to FP16 and back to FP32
+    model = model.half().float()
+    
+    # Check for large discrepancies or INF/NaN values
+    issues_found = False
+    for name, param in model.named_parameters():
+        # Calculate original value range
+        orig_param = fp32_params[name]
+        orig_max = orig_param.abs().max().item()
+        
+        # Calculate difference
+        diff = (param - orig_param).abs()
+        rel_diff = diff / (orig_param.abs() + 1e-8)  # Avoid div by zero
+        max_diff = diff.max().item()
+        max_rel_diff = rel_diff.max().item()
+        
+        # Check if values got clipped (FP16 max is ~65504)
+        clip_threshold = 65000  # Just below FP16 max
+        clipped_values = (orig_param.abs() > clip_threshold).sum().item()
+        
+        # Check if values got zeroed (FP16 min is ~6e-5)
+        min_threshold = 1e-4  # Just above FP16 min
+        zeroed_values = ((orig_param.abs() < min_threshold) & 
+                         (orig_param.abs() > 0) & 
+                         (param == 0)).sum().item()
+        
+        if max_rel_diff > 0.01 or clipped_values > 0 or zeroed_values > 0:
+            issues_found = True
+            print(f"Issue in {name}:")
+            print(f"  Original range: [{orig_param.min().item()}, {orig_param.max().item()}]")
+            print(f"  Max absolute difference: {max_diff}")
+            print(f"  Max relative difference: {max_rel_diff*100:.2f}%")
+            if clipped_values > 0:
+                print(f"  {clipped_values} values likely clipped (above {clip_threshold})")
+            if zeroed_values > 0:
+                print(f"  {zeroed_values} small values likely zeroed")
+                
+    if not issues_found:
+        print("No significant FP16 conversion issues detected")
+    
+    return issues_found
+
+
 def load_model(sample_only=False):
     global model, optimizer, scaler, iter_num, best_val_loss, iter_num_on_load
     checkpoint = None
     if init_from == 'scratch':
         print("Initializing a new model from scratch")
-        model = Dinov2ForTimeSeriesClassification(dino_size, len(id2label), classifier_type=classifier_type, cls_option=cls_option, use_reg=use_dino_registers)
+        model = Dinov2ForTimeSeriesClassification(dino_size, len(id2label), classifier_type=classifier_type, cls_option=cls_option, use_reg=use_dino_registers, dropout_rate=dropout_p)
     elif init_from == 'resume':
         print(f"Resuming training from {out_dir}")
         ckpt_path = os.path.join(out_dir, load_checkpoint_name)
         checkpoint = torch.load(ckpt_path, map_location=device)
-        model = Dinov2ForTimeSeriesClassification(dino_size, len(id2label), classifier_type=classifier_type, cls_option=cls_option, use_reg=use_dino_registers)
+        model = Dinov2ForTimeSeriesClassification(dino_size, len(id2label), classifier_type=classifier_type, cls_option=cls_option, use_reg=use_dino_registers, dropout_rate=dropout_p)
         state_dict = checkpoint['model']
-
+        # print(checkpoint["config"])   # if you forgot your model setup lol
         # added back in from nanogpt, apparently torch compile adds this
         unwanted_prefix = '_orig_mod.'
         for k,v in list(state_dict.items()):
@@ -123,6 +176,7 @@ def load_model(sample_only=False):
                 state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
         # print({k for k, v in state_dict.items() if not 'dinov2' in k})
         model.load_state_dict(state_dict, strict=False)
+        # check_fp16_conversion_issues(model)
         iter_num = checkpoint['iter_num']
         iter_num_on_load = iter_num
         best_val_loss = checkpoint['best_val_loss']
@@ -312,6 +366,7 @@ def get_batch(dataloader_iter, split):
 def train_loop():
     global iter_num, best_val_loss
     t0 = time.time()
+    init_dataloaders()
     local_iter_num = 0 # number of iterations in the lifetime of this process
     metrics_dict = {"losses": [], "val_losses": [], "val_loss_iters": [], "accuracy": [], "val_accs": [], "train_accs": []}
     print("Total train samples:", len(train_dataloader.dataset))

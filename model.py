@@ -9,6 +9,7 @@ try:
     import xformers.ops as xops
     XFORMERS_AVAILABLE = True
     print("successfully imported xformers")
+    
 except ImportError:
     XFORMERS_AVAILABLE = False
 # XFORMERS_AVAILABLE = False    # manual xformers override in case it's numerically different, should be fixed now
@@ -143,7 +144,7 @@ class EfficientTransformer(nn.Module):
         return self.norm(x)
 
 class Dinov2ForTimeSeriesClassification(nn.Module):
-    def __init__(self, size, num_classes, classifier_type, cls_option="patches_only", use_reg=True, dropout_rate=0.1):
+    def __init__(self, size, num_classes, classifier_type, cls_option="patches_only", use_reg=True, dropout_rate=0.2):
         super().__init__()
         self.size = size
         self.num_classes = num_classes
@@ -160,7 +161,7 @@ class Dinov2ForTimeSeriesClassification(nn.Module):
         self.max_frames = 3
         # Determine transformer embedding dimension
         self.use_dino_embed_size = False
-        self.transformer_dim = 128
+        self.transformer_dim = 64
 
         self.dinov2 = torch.hub.load('facebookresearch/dinov2', f'dinov2_vit{self.size[0].lower()}14{"_reg"*self.use_reg}')
         # print(self.dinov2)

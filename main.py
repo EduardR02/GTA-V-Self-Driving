@@ -7,7 +7,7 @@ from keys import PressKey, ReleaseKey, W, A, S, D
 import config
 from grabkeys import key_check
 from threading import Thread as Worker
-from training_new import load_model
+from training_new import load_model, ctx
 from dataloader import transform
 import torch
 import psutil
@@ -19,12 +19,13 @@ process = psutil.Process(os.getpid())
 # Set the priority to "High Priority" class
 process.nice(psutil.HIGH_PRIORITY_CLASS)
 
+
 # 0 - 1. Button presses can only be decided each time the model predicts, this is the max fraction of the full duration
 # a turn button will be pressed until the next model prediction. This helps the model to not wiggle from oversteering,
 # which is an "artifact" of low fps at inference time, but high fps when creating data. Meaning a turn key pressed when
 # making the data at higher fps is much less impactful than when the model predicts at a lower fps, because
 # it's prediction lasts for much longer.
-max_steer = 0.6
+max_steer = 1.0
 output_dict = {"w": 0, "a": 1, "s": 2, "d": 3}
 
 
@@ -49,10 +50,10 @@ def proportional_output_key(prediction, t_since_last_press):
     So instead we make them binary because that works really well.
     """
     press_keys = True
-    log_presses = False
-    min_val_steer = 0.0  # 0 - 1
-    speed_threshold = 0.5  # 0 - 1
-    prediction = prediction.numpy().squeeze()
+    log_presses = True
+    min_val_steer = 0.05  # 0 - 1 (0.01 - 0.05 seems best)       0.05 seems to be best for the best models, use 0.01 for more overfit models trained for very long with high batch size (512+) to cut out noise
+    speed_threshold = 0.1  # 0 - 1
+    prediction = prediction.float().numpy().squeeze()   # float in case bf16 selected
     # do this before thresholding to get the true values
     prediction = handle_opposite_keys(prediction, output_dict)
 
@@ -112,7 +113,6 @@ def show_screen():
 
 @torch.no_grad()
 def main_with_cnn():
-    global t_time
     model = load_model(sample_only=True)
     sct = mss.mss()
     counter = 0
@@ -141,17 +141,10 @@ def main_with_cnn():
         if "N" in key:
             release_all()
             time.sleep(5)
-        if "X" in key:
-            t_time = max(0.01, t_time - 0.01)
-            print(t_time)
-        if "B" in key:
-            t_time += 0.01
-            print(t_time)
 
 
 @torch.no_grad()
 def main_with_lstm():
-    global t_time
     model = load_model(sample_only=True)
     sct = mss.mss()
     t = time.time()
@@ -169,12 +162,14 @@ def main_with_lstm():
 
         image_buffer.append((current_time, img))    # timestamp for selecting images with best stride
         selected_images = select_images(image_buffer, desired_interval, config.sequence_len)
+        # display_selected_images(selected_images)
 
         img_tensor = torch.stack([transform(image=img)["image"] for img in selected_images], dim=0)   # first timedim, then batch
         img_tensor = img_tensor[None, ...]  # add dummy batch dim
         img_tensor = img_tensor.pin_memory().to("cuda")
-        prediction, _ = model(img_tensor)
-        prediction = torch.nn.functional.sigmoid(prediction.cpu())
+        with ctx:
+            prediction, _ = model(img_tensor)
+            prediction = torch.nn.functional.sigmoid(prediction.cpu())
         proportional_output_key(prediction, time.time() - last_press_time)
         last_press_time = time.time()
         key = key_check()
@@ -190,12 +185,47 @@ def main_with_lstm():
             image_buffer.clear()
             release_all()
             time.sleep(5)
-        if "X" in key:
-            t_time = max(0.01, t_time - 0.01)
-            print(t_time)
-        if "B" in key:
-            t_time += 0.01
-            print(t_time)
+
+
+def display_selected_images(selected_images):
+    """
+    Display the selected images side by side in a non-blocking window.
+    The newest image is on the left, oldest on the right.
+    
+    Args:
+        selected_images: List of images to display
+    """
+    if not hasattr(display_selected_images, "window_created"):
+        # Create window only once
+        cv2.namedWindow("Selected Images", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("Selected Images", 1200, 300)  # Adjust size as needed
+        display_selected_images.window_created = True
+    
+    if not selected_images:
+        return
+        
+    # Create a single wide image to display all frames side by side
+    vis_height = selected_images[0].shape[0]
+    vis_width = selected_images[0].shape[1] * len(selected_images)
+    visualization = np.zeros((vis_height, vis_width, 3), dtype=np.uint8)
+    
+    # Reverse the order for display (newest on left, oldest on right)
+    reversed_images = selected_images[::-1]
+    
+    for i, img in enumerate(reversed_images):
+        x_offset = i * img.shape[1]
+        # Convert from RGB to BGR for proper display with OpenCV
+        display_img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        visualization[:, x_offset:x_offset+img.shape[1], :] = display_img
+        
+        # Labels for reversed order - newest is first, oldest is last
+        label = "Newest" if i == 0 else "Oldest" if i == len(reversed_images)-1 else f"t-{i}"
+        cv2.putText(visualization, label, (x_offset + 10, vis_height - 20), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+    
+    # Display the visualization
+    cv2.imshow("Selected Images", visualization)
+    cv2.waitKey(1)  # Update the window (non-blocking)
 
 
 def select_images(image_buffer, desired_interval, sequence_len):
@@ -224,7 +254,6 @@ def select_images(image_buffer, desired_interval, sequence_len):
     # Pad with the oldest selected image if we don't have enough
     while len(selected_images) < sequence_len:
         selected_images.append(selected_images[-1])
-
     return list(reversed(selected_images))
 
 
