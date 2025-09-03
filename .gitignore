@@ -9,3 +9,4 @@ __pycache__/
 *.sh
 training_new_h100.py
 .venv/
+dinov3/

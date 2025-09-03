@@ -14,8 +14,8 @@ import config
 
 ADE_MEAN = (0.485, 0.456, 0.406)
 ADE_STD = (0.229, 0.224, 0.225)
-height = 182    # 14 * 13
-width = 252     # 14 * 18
+height = 192    # dinov2 is 14 * 13, dinov3 is 16 * 12 = 192
+width = 240     # dinov2 is 14 * 18, dinov3 is 16 * 15 = 240
 minimap_mask = np.zeros((config.height, config.width), dtype=np.uint8)
 # Minimap coordinates, (before padding for patches)
 x1, y1 = 3, config.height - 36  # Top-left corner of minimap

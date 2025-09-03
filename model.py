@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from torchtune.modules import RotaryPositionalEmbeddings
+import os
 
 
 # Add xformers import
@@ -12,12 +13,14 @@ try:
     
 except ImportError:
     XFORMERS_AVAILABLE = False
+    print("xformers not available")
 # XFORMERS_AVAILABLE = False    # manual xformers override in case it's numerically different, should be fixed now
 try:
     from flash_attn import flash_attn_func
     FLASH_ATTN_AVAILABLE = True
     print("successfully imported flash attention")
 except ImportError:
+    print("flash attention not available")
     FLASH_ATTN_AVAILABLE = False
 
 
@@ -144,7 +147,7 @@ class EfficientTransformer(nn.Module):
         return self.norm(x)
 
 class Dinov2ForTimeSeriesClassification(nn.Module):
-    def __init__(self, size, num_classes, classifier_type, cls_option="patches_only", use_reg=True, dropout_rate=0.2):
+    def __init__(self, size, num_classes, classifier_type, cls_option="patches_only", use_reg=True, dropout_rate=0.0):
         super().__init__()
         self.size = size
         self.num_classes = num_classes
@@ -154,14 +157,14 @@ class Dinov2ForTimeSeriesClassification(nn.Module):
         self.return_class_token = cls_option == "both"
         self.dropout_rate = dropout_rate
         # Transformer parameters - keep fixed head count
-        self.num_heads = 8
+        self.num_heads = 6
         self.num_layers = 6
         # Calculate exact context length based on patches and frames
         self.patches_per_frame = 13 * 18  # 234 patches per frame
         self.max_frames = 3
         # Determine transformer embedding dimension
         self.use_dino_embed_size = False
-        self.transformer_dim = 64
+        self.transformer_dim = 48
 
         self.dinov2 = torch.hub.load('facebookresearch/dinov2', f'dinov2_vit{self.size[0].lower()}14{"_reg"*self.use_reg}')
         # print(self.dinov2)
@@ -281,4 +284,122 @@ class Dinov2ForTimeSeriesClassification(nn.Module):
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
         print(f"using fused AdamW: {use_fused}")
 
+        return optimizer
+
+
+class Dinov3ForTimeSeriesClassification(nn.Module):
+    def __init__(self, size, num_classes, expected_input_hw, dropout_rate=0.0, repo_dir="dinov3"):
+        super().__init__()
+        self.size = size
+        self.num_classes = num_classes
+        self.expected_input_hw = expected_input_hw
+        self.dropout_rate = dropout_rate
+        self.max_frames = 3
+
+        # Aggregator params (same as v2)
+        self.num_heads = 6
+        self.num_layers = 6
+        self.use_dino_embed_size = False
+        self.transformer_dim = 48
+
+        # Load DINOv3 backbone
+        size2hub = {
+            "base":  "dinov3_vitb16",
+            "large": "dinov3_vitl16",
+            "huge":  "dinov3_vith16",
+        }
+        weights_path = {
+            "base": "dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth",
+            "large": "dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth",
+            "huge": "dinov3_vith16plus_pretrain_lvd1689m-7c1da9a5.pth",
+        }
+        weights_path_full = os.path.join(repo_dir, "weights", weights_path[self.size])
+        self.dinov3 = torch.hub.load(repo_dir, size2hub[self.size], source='local', weights=weights_path_full)
+
+        # Get embedding dimension
+        self.dinov3_embed_dim = self.dinov3.norm.weight.shape[0]
+
+        # Compute actual patches per frame from a test forward pass
+        with torch.no_grad():
+            dummy = torch.randn(1, 3, *expected_input_hw)
+            test_patches = self.dinov3.get_intermediate_layers(
+                dummy, n=1, reshape=False, return_class_token=False, return_extra_tokens=False, norm=True
+            )[0]
+            self.patches_per_frame = test_patches.shape[1]
+            print(f"DINOv3 {size}: {self.dinov3_embed_dim}D, {self.patches_per_frame} patches/frame")
+
+        # BCE loss
+        self.loss_fct = torch.nn.BCEWithLogitsLoss()
+
+        # Projection to transformer dim
+        if self.use_dino_embed_size or self.transformer_dim is None:
+            self.embed_dim = self.dinov3_embed_dim
+        else:
+            self.embed_dim = self.transformer_dim
+        
+        self.projection = nn.Linear(self.dinov3_embed_dim, self.embed_dim) if self.dinov3_embed_dim != self.embed_dim else nn.Identity()
+
+        # Learnable CLS for aggregator
+        self.cls_token = nn.Parameter(torch.randn(1, 1, self.embed_dim))
+
+        # Efficient transformer
+        self.transformer = EfficientTransformer(
+            hidden_size=self.embed_dim,
+            num_heads=self.num_heads,
+            num_layers=self.num_layers,
+            dropout=dropout_rate,
+            use_xformers=True,
+            max_seq_len=1 + self.patches_per_frame * self.max_frames
+        )
+
+        self.fc_head = nn.Linear(self.embed_dim, num_classes)
+
+    def _extract_patch_tokens(self, x):
+        # Efficient patch extraction - patches only, last layer, normed
+        return self.dinov3.get_intermediate_layers(
+            x, n=1, reshape=False, return_class_token=False, return_extra_tokens=False, norm=True
+        )[0]
+
+    def forward(self, x, labels=None):
+        batch_size, seq_len = x.shape[:2]
+        x = x.reshape(-1, *x.shape[2:])
+
+        # Extract and project patch features
+        patch_feats = self._extract_patch_tokens(x)
+        patch_feats = self.projection(patch_feats)
+        out = patch_feats.reshape(batch_size, seq_len * self.patches_per_frame, self.embed_dim)
+
+        # Aggregate with transformer
+        learnable_cls = self.cls_token.expand(batch_size, 1, -1)
+        out = torch.cat([learnable_cls, out], dim=1)
+        out = self.transformer(out)[:, 0]
+        out = self.fc_head(out)
+
+        # Compute loss
+        loss = None
+        if labels is not None:
+            last_label = labels[:, -1, :]
+            loss = self.loss_fct(out.view(-1, self.num_classes), last_label.view(-1, self.num_classes))
+        
+        return out, loss
+
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+        # Same as DINOv2 version
+        param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        
+        fused_available = True
+        use_fused = fused_available and device_type == 'cuda'
+        extra_args = dict(fused=True) if use_fused else dict()
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+        print(f"using fused AdamW: {use_fused}")
         return optimizer

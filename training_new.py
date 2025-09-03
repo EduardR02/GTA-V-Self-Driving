@@ -4,7 +4,7 @@ import torch
 import os
 from contextlib import nullcontext
 from dataloader import get_dataloader
-from model import Dinov2ForTimeSeriesClassification
+from model import Dinov2ForTimeSeriesClassification, Dinov3ForTimeSeriesClassification
 import matplotlib.pyplot as plt
 import math
 import time
@@ -31,13 +31,14 @@ always_save_checkpoint = True # if True, always save a checkpoint after each eva
 fine_tune = False   # train the entire model or just the top
 freeze_non_dino_layers = False
 init_from = 'scratch' # 'scratch' or 'resume'
-dino_size = "base"  # small is ~21M, base ~86M, large ~300M, giant ~1.1B
+use_dinov3 = True  # Toggle: True for DINOv3, False for DINOv2
+dino_size = "large"  # small is ~21M, base ~86M, large ~300M, giant ~1.1B
 use_dino_registers = True
-load_checkpoint_name = "optim_64.pt"
-save_checkpoint_name = "optim_64.pt"
-metrics_name = "optim_64.png"
-gradient_accumulation_steps = 4 # used to simulate larger batch sizes
-batch_size = 64    # if gradient_accumulation_steps > 1, this is the micro-batch size
+load_checkpoint_name = "optim_48_512_35k.pt"
+save_checkpoint_name = "test.pt"
+metrics_name = "test.png"
+gradient_accumulation_steps = 1 # used to simulate larger batch sizes
+batch_size = 128    # if gradient_accumulation_steps > 1, this is the micro-batch size
 train_split = 0.95   # test val split, keep same for resume
 convert_to_greyscale = False
 sequence_len = 3
@@ -53,7 +54,7 @@ shift_labels = True
 
 # adamw optimizer
 learning_rate = 2e-4 # max learning rate
-max_iters = 60000 # total number of training iterations
+max_iters = 100000 # total number of training iterations
 # optimizer settings
 weight_decay = 0.05
 beta1 = 0.9
@@ -69,7 +70,7 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 # change this to bf16 if your gpu actually supports it
-dtype = 'float16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
+dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
@@ -161,20 +162,26 @@ def load_model(sample_only=False):
     checkpoint = None
     if init_from == 'scratch':
         print("Initializing a new model from scratch")
-        model = Dinov2ForTimeSeriesClassification(dino_size, len(id2label), classifier_type=classifier_type, cls_option=cls_option, use_reg=use_dino_registers, dropout_rate=dropout_p)
+        if use_dinov3:
+            model = Dinov3ForTimeSeriesClassification(dino_size, len(id2label), expected_input_hw=(192, 240), dropout_rate=dropout_p)
+        else:
+            model = Dinov2ForTimeSeriesClassification(dino_size, len(id2label), classifier_type=classifier_type, cls_option=cls_option, use_reg=use_dino_registers, dropout_rate=dropout_p)
     elif init_from == 'resume':
         print(f"Resuming training from {out_dir}")
         ckpt_path = os.path.join(out_dir, load_checkpoint_name)
         checkpoint = torch.load(ckpt_path, map_location=device)
-        model = Dinov2ForTimeSeriesClassification(dino_size, len(id2label), classifier_type=classifier_type, cls_option=cls_option, use_reg=use_dino_registers, dropout_rate=dropout_p)
+        if use_dinov3:
+            model = Dinov3ForTimeSeriesClassification(dino_size, len(id2label), expected_input_hw=(192, 240), dropout_rate=dropout_p)
+        else:
+            model = Dinov2ForTimeSeriesClassification(dino_size, len(id2label), classifier_type=classifier_type, cls_option=cls_option, use_reg=use_dino_registers, dropout_rate=dropout_p)
         state_dict = checkpoint['model']
-        # print(checkpoint["config"])   # if you forgot your model setup lol
+        print(checkpoint["config"])   # if you forgot your model setup lol
         # added back in from nanogpt, apparently torch compile adds this
         unwanted_prefix = '_orig_mod.'
         for k,v in list(state_dict.items()):
             if k.startswith(unwanted_prefix):
                 state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-        # print({k for k, v in state_dict.items() if not 'dinov2' in k})
+        # print({(k, v.shape) for k, v in state_dict.items() if not 'dinov2' in k})
         model.load_state_dict(state_dict, strict=False)
         # check_fp16_conversion_issues(model)
         iter_num = checkpoint['iter_num']
@@ -199,7 +206,7 @@ def load_model(sample_only=False):
 
     # freeze or unfreeze model
     for name, param in model.named_parameters():
-        if "dinov2" in name:
+        if "dinov2" in name or "dinov3" in name:
             param.requires_grad = fine_tune
         if sequence_len > 1 and freeze_non_dino_layers and "classifier" in name and "layer_norm" not in name:
             param.requires_grad = False
@@ -392,7 +399,7 @@ def train_loop():
                 best_val_loss = losses_and_accs['val'] if losses_and_accs['val'] < best_val_loss else best_val_loss
                 if iter_num > 0:
                     # torch.compile prepends stuff to the name!!! (_orig_mod.), so can't use startswith, but need to use "in"
-                    state_dict = model.state_dict() if fine_tune else {k: v for k, v in model.state_dict().items() if not "dinov2" in k}
+                    state_dict = model.state_dict() if fine_tune else {k: v for k, v in model.state_dict().items() if ("dinov2" not in k and "dinov3" not in k)}
                     checkpoint = {
                         'model': state_dict,
                         'optimizer': optimizer.state_dict(),
