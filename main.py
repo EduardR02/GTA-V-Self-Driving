@@ -51,16 +51,19 @@ def proportional_output_key(prediction, t_since_last_press):
     """
     press_keys = True
     log_presses = True
-    min_val_steer = 0.05  # 0 - 1 (0.01 - 0.05 seems best)       0.05 seems to be best for the best models, use 0.01 for more overfit models trained for very long with high batch size (512+) to cut out noise
-    speed_threshold = 0.1  # 0 - 1
+    min_val_steer = 0.1  # 0 - 1 (0.01 - 0.05 seems best)       0.05 seems to be best for the best models, use 0.01 for more overfit models trained for very long with high batch size (512+) to cut out noise
+    speed_threshold = 0.2  # 0 - 1
     prediction = prediction.float().numpy().squeeze()   # float in case bf16 selected
     # do this before thresholding to get the true values
     prediction = handle_opposite_keys(prediction, output_dict)
 
     press_durations = np.where(prediction < min_val_steer, 0, prediction)
-    # Binary thresholding for speed keys (W, S): either 0 or 1
-    press_durations[[output_dict['w'], output_dict['s']]] = np.where(
-        prediction[[output_dict['w'], output_dict['s']]] >= speed_threshold, 1, 0)
+    # Binary thresholding for speed keys (W, S): only the larger value can be 1
+    w_idx, s_idx = output_dict['w'], output_dict['s']
+    w_val, s_val = prediction[w_idx], prediction[s_idx]
+    press_durations[w_idx] = (w_val >= speed_threshold) * (w_val >= s_val)
+    press_durations[s_idx] = (s_val >= 0.5) * (s_val > w_val)
+    # if prediction[output_dict['s']] < 0.5: press_durations[output_dict['s']] = 0
     # don't care about speed key values because we just want to press or not press
     press_durations *= t_since_last_press
     if press_keys:
@@ -151,7 +154,7 @@ def main_with_lstm():
     last_press_time = time.time()
     counter = 0
     # Use a deque to store timestamped images
-    max_stored_images = 20  # Adjust this value based on your memory constraints
+    max_stored_images = 40  # Adjust this value based on your memory constraints
     image_buffer = deque(maxlen=max_stored_images)
 
     desired_interval = config.sequence_stride / config.fps_at_recording_time
@@ -171,6 +174,7 @@ def main_with_lstm():
             prediction, _ = model(img_tensor)
             prediction = torch.nn.functional.sigmoid(prediction.cpu())
         proportional_output_key(prediction, time.time() - last_press_time)
+        # print(prediction)
         last_press_time = time.time()
         key = key_check()
 

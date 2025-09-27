@@ -14,8 +14,12 @@ import config
 
 ADE_MEAN = (0.485, 0.456, 0.406)
 ADE_STD = (0.229, 0.224, 0.225)
-height = 192    # dinov2 is 14 * 13, dinov3 is 16 * 12 = 192
-width = 240     # dinov2 is 14 * 18, dinov3 is 16 * 15 = 240
+if config.use_dinov3:
+    height = 192    # 16 * 12
+    width = 240     # 16 * 15
+else:
+    height = 182    # 14 * 13
+    width = 252     # 14 * 18
 minimap_mask = np.zeros((config.height, config.width), dtype=np.uint8)
 # Minimap coordinates, (before padding for patches)
 x1, y1 = 3, config.height - 36  # Top-left corner of minimap
@@ -59,7 +63,7 @@ class H5Dataset(Dataset):
         self.train_transform_with_zoom = A.Compose([
             A.Affine(scale=(1.05, 1.2), p=self.zoom_prob),
             color_jitter_replace,
-            RandomSkyMask(height_limit=(0.3, 0.4), p=0.75),
+            # RandomSkyMask(height_limit=(0.3, 0.4), p=0.75),
         ], additional_targets=additional_targets)
 
     def _create_lookup_table(self):
@@ -321,7 +325,7 @@ additional_targets = {f'image{i}': 'image' for i in range(1, config.sequence_len
 
 train_transform_no_zoom = A.Compose([
     color_jitter_replace,
-    RandomSkyMask(height_limit=(0.3, 0.4), p=0.75),
+    # RandomSkyMask(height_limit=(0.3, 0.4), p=0.75),
 ], additional_targets=additional_targets)
 
 
