@@ -44,16 +44,25 @@ class EfficientTransformerBlock(nn.Module):
         self.use_dropout = dropout > 0
         if self.use_dropout:
             self.dropout = nn.Dropout(dropout)
-        self.norm1 = nn.LayerNorm(hidden_size)
-        self.norm2 = nn.LayerNorm(hidden_size)
-        self.mlp = nn.Sequential(
-            nn.Linear(hidden_size, 4 * hidden_size),
-            nn.GELU(),
-            nn.Linear(4 * hidden_size, hidden_size),
-        )
+        self.norm1 = nn.RMSNorm(hidden_size)
+        self.norm2 = nn.RMSNorm(hidden_size)
+
+        # swiglu mlp
+        self.multiple_of = 64
+        self.hidden_dim = 4 * hidden_size
+        self.hidden_dim = int(2 * self.hidden_dim / 3)  # to keep param count roughly same as normal 4 * hidden_size (with swiglu we need ffn matrices instead of one)
+        self.hidden_dim = self.multiple_of * ((self.hidden_dim + self.multiple_of - 1) // self.multiple_of)      # round up to multiple_of
+        
+        self.mlp_linear_1 = nn.Linear(self.hidden_size, self.hidden_dim, bias=False)
+        self.mlp_linear_2 = nn.Linear(self.hidden_size, self.hidden_dim, bias=False)
+        self.mlp_linear_3 = nn.Linear(self.hidden_dim, self.hidden_size, bias=False)
         
         # RoPE (Rotary Position Embedding)
         self.rope = RotaryPositionalEmbeddings(self.head_dim, max_seq_len=max_seq_len)
+
+    def swiglu_mlp(self, x):
+        # swiglu(x) = (xW1 + b1) * swish(xW2 + b2), where swish(x) = x * sigmoid(x)
+        return self.mlp_linear_3(F.silu(self.mlp_linear_1(x)) * self.mlp_linear_2(x))
     
     def forward(self, x, cls_attention_only=False):
         # Pre-norm for attention
@@ -101,7 +110,7 @@ class EfficientTransformerBlock(nn.Module):
         
         return self.post_attention_stuff(x, attn.view(batch_size, seq_len, hidden_size))
     
-    def normal_attention(self, q, k, v):
+    def normal_attention(self, q, k, v):    # slow, fallback
         # Match xFormers' exact pattern of operations, https://facebookresearch.github.io/xformers/components/ops.html
         q = q * self.scale
         q = q.transpose(1, 2)
@@ -120,7 +129,7 @@ class EfficientTransformerBlock(nn.Module):
 
         # Residual connection and post-norm MLP
         x = x + attn
-        mlp_out = self.mlp(self.norm2(x))
+        mlp_out = self.swiglu_mlp(self.norm2(x))
 
         if self.use_dropout:
             mlp_out = self.dropout(mlp_out)
@@ -137,7 +146,7 @@ class EfficientTransformer(nn.Module):
             EfficientTransformerBlock(hidden_size, num_heads, dropout, use_xformers, max_seq_len)
             for _ in range(num_layers)
         ])
-        self.norm = nn.LayerNorm(hidden_size)
+        self.norm = nn.RMSNorm(hidden_size)
         self.num_layers = num_layers
         
     def forward(self, x):
@@ -308,7 +317,7 @@ class Dinov3ForTimeSeriesClassification(nn.Module):
         self.num_heads = 8
         self.num_layers = 12
         self.use_dino_embed_size = False
-        self.transformer_dim = 256
+        self.transformer_dim = 128
 
         if use_transformers:
             from transformers import AutoModel, AutoImageProcessor
@@ -367,7 +376,7 @@ class Dinov3ForTimeSeriesClassification(nn.Module):
 
         print(f"DINOv3 {size}: {self.dinov3_embed_dim}D, {self.patches_per_frame} patches/frame, cls_option={cls_option}")
 
-        pos_weights = torch.tensor([1.0, 11.285, 25.556 / 2.0, 11.392])  # Start unbiased, training will schedule
+        pos_weights = torch.tensor([1.0, 11.285, 25.556, 11.392])  # Start unbiased, training will schedule
         self.loss_fct = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weights)
 
         # Set embedding dimensions
