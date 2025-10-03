@@ -27,7 +27,7 @@ except ImportError:
 # pos_weights = torch.tensor([0.585, 11.285, 25.556, 11.392]) # calculated from data
 
 class EfficientTransformerBlock(nn.Module):
-    def __init__(self, hidden_size, num_heads, dropout=0.0, use_xformers=True, max_seq_len=4096):
+    def __init__(self, hidden_size, num_heads, dropout=0.0, use_xformers=True, max_seq_len=4096, cls_attention_only=False):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_heads = num_heads
@@ -35,6 +35,7 @@ class EfficientTransformerBlock(nn.Module):
         self.scale = float(1 / (self.head_dim ** -0.5))     # xformers also requires 1/ already
         self.use_xformers = use_xformers and XFORMERS_AVAILABLE
         self.use_flash_attn = FLASH_ATTN_AVAILABLE
+        self.cls_attention_only = cls_attention_only
         
         # Keep the same parameter initialization for both implementations
         self.q_proj = nn.Linear(hidden_size, hidden_size, bias=False)
@@ -59,56 +60,70 @@ class EfficientTransformerBlock(nn.Module):
         
         # RoPE (Rotary Position Embedding)
         self.rope = RotaryPositionalEmbeddings(self.head_dim, max_seq_len=max_seq_len)
+        
+        # Select attention implementation based on available backends
+        if self.use_flash_attn:
+            self.attn_func = self._flash_attention
+        elif self.use_xformers:
+            self.attn_func = self._xformers_attention
+        else:
+            self.attn_func = self.normal_attention
+        
+        # Bind appropriate forward method based on attention mode
+        if cls_attention_only:
+            self.forward = self._forward_cls_only
+        else:
+            self.forward = self._forward_full
 
     def swiglu_mlp(self, x):
         # swiglu(x) = (xW1 + b1) * swish(xW2 + b2), where swish(x) = x * sigmoid(x)
         return self.mlp_linear_3(F.silu(self.mlp_linear_1(x)) * self.mlp_linear_2(x))
     
-    def forward(self, x, cls_attention_only=False):
-        # Pre-norm for attention
+    def _flash_attention(self, q, k, v):
+        """Flash attention wrapper"""
+        return flash_attn_func(q, k, v, softmax_scale=self.scale)
+    
+    def _xformers_attention(self, q, k, v):
+        """xFormers memory efficient attention wrapper"""
+        return xops.memory_efficient_attention(q, k, v, scale=self.scale)
+    
+    def _forward_cls_only(self, x):
+        """Forward pass that only computes CLS token attention (last layer optimization)"""
         norm_x = self.norm1(x)
         batch_size, seq_len, hidden_size = norm_x.shape
         
-        # Split the computation based on cls_attention_only for better efficiency
-        if cls_attention_only:
-            # Extract just what we need - CLS token only
-            cls_token = x[:, 0:1]  # [batch, 1, hidden]
-            
-            # For CLS-only attention, only compute q for CLS token, but k,v for all tokens
-            q_cls = self.q_proj(norm_x[:, 0:1]).view(batch_size, 1, self.num_heads, self.head_dim)  # Only compute q for CLS token
-            k = self.k_proj(norm_x).view(batch_size, seq_len, self.num_heads, self.head_dim)  # Compute k for all tokens
-            v = self.v_proj(norm_x).view(batch_size, seq_len, self.num_heads, self.head_dim)  # Compute v for all tokens
+        # Only compute query for CLS token, but key/value for all tokens
+        q_cls = self.q_proj(norm_x[:, 0:1]).view(batch_size, 1, self.num_heads, self.head_dim)
+        k = self.k_proj(norm_x).view(batch_size, seq_len, self.num_heads, self.head_dim)
+        v = self.v_proj(norm_x).view(batch_size, seq_len, self.num_heads, self.head_dim)
 
-            # apply rope after view and BEFORE transpose
-            q_cls = self.rope(q_cls)
-            k = self.rope(k)
-            
-            # always do normal attention due to only having the single cls token that we need attention for
-            if self.use_flash_attn:
-                attn = flash_attn_func(q_cls, k, v, softmax_scale=self.scale)
-            else:
-                attn = self.normal_attention(q_cls, k, v)
-            return self.post_attention_stuff(cls_token, attn.view(batch_size, 1, hidden_size))
+        q_cls = self.rope(q_cls)
+        k = self.rope(k)
         
-        # Standard attention for all tokens (non-cls-only layers)
-        else:
-            # Compute Q, K, V for all tokens
-            q = self.q_proj(norm_x).view(batch_size, seq_len, self.num_heads, self.head_dim)
-            k = self.k_proj(norm_x).view(batch_size, seq_len, self.num_heads, self.head_dim)
-            v = self.v_proj(norm_x).view(batch_size, seq_len, self.num_heads, self.head_dim)
+        attn = self.attn_func(q_cls, k, v)
+        attn = attn.view(batch_size, 1, hidden_size)
+        x = x[:, 0:1]  # Keep only CLS token
+        
+        return self.post_attention_stuff(x, attn)
+    
+    def _forward_full(self, x):
+        """Forward pass that computes full attention for all tokens"""
+        norm_x = self.norm1(x)
+        batch_size, seq_len, hidden_size = norm_x.shape
+        
+        # Compute Q, K, V for all tokens
+        q = self.q_proj(norm_x).view(batch_size, seq_len, self.num_heads, self.head_dim)
+        k = self.k_proj(norm_x).view(batch_size, seq_len, self.num_heads, self.head_dim)
+        v = self.v_proj(norm_x).view(batch_size, seq_len, self.num_heads, self.head_dim)
 
-            # apply rope after view and BEFORE transpose
-            q = self.rope(q)
-            k = self.rope(k)
-            if self.use_xformers and not self.use_flash_attn:
-                attn = xops.memory_efficient_attention(q, k, v, scale=self.scale)
-            else:
-                if self.use_flash_attn:
-                    attn = flash_attn_func(q, k, v, softmax_scale=self.scale)
-                else:
-                    attn = self.normal_attention(q, k, v)
+        # apply rope after view and BEFORE transpose
+        q = self.rope(q)
+        k = self.rope(k)
         
-        return self.post_attention_stuff(x, attn.view(batch_size, seq_len, hidden_size))
+        attn = self.attn_func(q, k, v)
+        attn = attn.view(batch_size, seq_len, hidden_size)
+        
+        return self.post_attention_stuff(x, attn)
     
     def normal_attention(self, q, k, v):    # slow, fallback
         # Match xFormers' exact pattern of operations, https://facebookresearch.github.io/xformers/components/ops.html
@@ -142,18 +157,20 @@ class EfficientTransformerBlock(nn.Module):
 class EfficientTransformer(nn.Module):
     def __init__(self, hidden_size, num_heads, num_layers, dropout=0.0, use_xformers=True, max_seq_len=4096):
         super().__init__()
+        # Last layer only computes CLS token attention (we only use [:, 0] anyway)
         self.layers = nn.ModuleList([
-            EfficientTransformerBlock(hidden_size, num_heads, dropout, use_xformers, max_seq_len)
-            for _ in range(num_layers)
+            EfficientTransformerBlock(
+                hidden_size, num_heads, dropout, use_xformers, max_seq_len,
+                cls_attention_only=(i == num_layers - 1)
+            )
+            for i in range(num_layers)
         ])
         self.norm = nn.RMSNorm(hidden_size)
         self.num_layers = num_layers
         
     def forward(self, x):
-        for i, layer in enumerate(self.layers):
-            # Optimize the last layer by only computing CLS token attention
-            cls_attention_only = (i == self.num_layers - 1)
-            x = layer(x, cls_attention_only=cls_attention_only)
+        for layer in self.layers:
+            x = layer(x)
         return self.norm(x)
 
 class Dinov2ForTimeSeriesClassification(nn.Module):
@@ -315,7 +332,7 @@ class Dinov3ForTimeSeriesClassification(nn.Module):
 
         # Aggregator params
         self.num_heads = 8
-        self.num_layers = 12
+        self.num_layers = 6
         self.use_dino_embed_size = False
         self.transformer_dim = 128
 
@@ -359,6 +376,22 @@ class Dinov3ForTimeSeriesClassification(nn.Module):
             self.dinov3_embed_dim = self.dinov3.norm.weight.shape[0]
             self.num_register_tokens = getattr(self.dinov3, 'num_register_tokens', 0)
 
+        # Bind specialized token extraction and forward methods based on configuration
+        if self.use_transformers:
+            if cls_option == "patches_only":
+                self._token_extractor = self._extract_tokens_patches_only_transformers
+                self._forward_processor = self._forward_patches_only
+            else:  # "both"
+                self._token_extractor = self._extract_tokens_both_transformers
+                self._forward_processor = self._forward_both
+        else:
+            if cls_option == "patches_only":
+                self._token_extractor = self._extract_tokens_patches_only_torch_hub
+                self._forward_processor = self._forward_patches_only
+            else:  # "both"
+                self._token_extractor = self._extract_tokens_both_torch_hub
+                self._forward_processor = self._forward_both
+
         # Compute patches per frame
         with torch.no_grad():
             device = next(self.dinov3.parameters()).device
@@ -376,7 +409,7 @@ class Dinov3ForTimeSeriesClassification(nn.Module):
 
         print(f"DINOv3 {size}: {self.dinov3_embed_dim}D, {self.patches_per_frame} patches/frame, cls_option={cls_option}")
 
-        pos_weights = torch.tensor([1.0, 11.285, 25.556, 11.392])  # Start unbiased, training will schedule
+        pos_weights = torch.tensor([1.0, 11.285, 25.556/2, 11.392])
         self.loss_fct = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weights)
 
         # Set embedding dimensions
@@ -405,49 +438,60 @@ class Dinov3ForTimeSeriesClassification(nn.Module):
 
         self.fc_head = nn.Linear(self.embed_dim, num_classes)
 
+    def _extract_tokens_patches_only_transformers(self, x):
+        """Extract patch tokens only - HuggingFace Transformers version"""
+        outputs = self.dinov3(pixel_values=x)
+        hidden_states = outputs.last_hidden_state
+        # Skip CLS (pos 0) and register tokens, keep patches only
+        return hidden_states[:, 1 + self.num_register_tokens:, :]
+    
+    def _extract_tokens_both_transformers(self, x):
+        """Extract CLS + patch tokens - HuggingFace Transformers version"""
+        outputs = self.dinov3(pixel_values=x)
+        hidden_states = outputs.last_hidden_state
+        cls_tokens = hidden_states[:, 0:1, :]  # CLS token at position 0
+        patch_tokens = hidden_states[:, 1 + self.num_register_tokens:, :]  # Skip CLS + register tokens
+        return patch_tokens, cls_tokens
+    
+    def _extract_tokens_patches_only_torch_hub(self, x):
+        """Extract patch tokens only - torch.hub version"""
+        return self.dinov3.get_intermediate_layers(
+            x, n=1, reshape=False, return_class_token=False, return_extra_tokens=False, norm=True
+        )[0]
+    
+    def _extract_tokens_both_torch_hub(self, x):
+        """Extract CLS + patch tokens - torch.hub version"""
+        patch_tokens, cls_tokens = self.dinov3.get_intermediate_layers(
+            x, n=1, reshape=False, return_class_token=True, return_extra_tokens=False, norm=True
+        )[0]
+        # torch.hub returns cls_tokens as [batch*seq_len, embed_dim], add dimension for concatenation
+        cls_tokens = cls_tokens.unsqueeze(1)  # [batch*seq_len, 1, embed_dim]
+        return patch_tokens, cls_tokens
+    
     def _extract_tokens(self, x):
-        """Extract tokens based on cls_option: patches only or both CLS+patches"""
-        if self.use_transformers:
-            outputs = self.dinov3(pixel_values=x)
-            hidden_states = outputs.last_hidden_state
-            
-            if self.cls_option == "patches_only":
-                # Skip CLS (pos 0) and register tokens, keep patches only
-                return hidden_states[:, 1 + self.num_register_tokens:, :]
-            else:  # "both"
-                cls_tokens = hidden_states[:, 0:1, :]  # CLS token at position 0
-                patch_tokens = hidden_states[:, 1 + self.num_register_tokens:, :]  # Skip CLS + register tokens
-                return patch_tokens, cls_tokens
-                
-        else:
-            # torch.hub implementation
-            if self.cls_option == "patches_only":
-                return self.dinov3.get_intermediate_layers(
-                    x, n=1, reshape=False, return_class_token=False, return_extra_tokens=False, norm=True
-                )[0]
-            else:  # "both"
-                patch_tokens, cls_tokens = self.dinov3.get_intermediate_layers(
-                    x, n=1, reshape=False, return_class_token=True, return_extra_tokens=False, norm=True
-                )[0]
-                # torch.hub returns cls_tokens as [batch*seq_len, embed_dim], add dimension for concatenation
-                cls_tokens = cls_tokens.unsqueeze(1)  # [batch*seq_len, 1, embed_dim]
-                return patch_tokens, cls_tokens
+        """Route to appropriate token extraction method"""
+        return self._token_extractor(x)
 
+    def _forward_patches_only(self, x, batch_size, seq_len):
+        """Process frames with patch tokens only"""
+        patch_tokens = self._extract_tokens(x)  # [batch*seq_len, patches_per_frame, dinov3_embed_dim]
+        out = self.projection(patch_tokens).reshape(batch_size, seq_len * self.patches_per_frame, self.embed_dim)
+        return out
+    
+    def _forward_both(self, x, batch_size, seq_len):
+        """Process frames with both CLS and patch tokens"""
+        patch_tokens, cls_tokens = self._extract_tokens(x)
+        # Combine CLS + patches for each frame: [batch*seq_len, 1+patches_per_frame, dinov3_embed_dim]
+        combined = torch.cat([cls_tokens, patch_tokens], dim=1)
+        out = self.projection(combined).reshape(batch_size, seq_len * (1 + self.patches_per_frame), self.embed_dim)
+        return out
+    
     def forward(self, x, labels=None):
         batch_size, seq_len = x.shape[:2]
         x = x.reshape(-1, *x.shape[2:])  # [batch*seq_len, C, H, W]
 
-        # Extract and process tokens based on cls_option
-        if self.cls_option == "patches_only":
-            # Extract patches only
-            patch_tokens = self._extract_tokens(x)  # [batch*seq_len, patches_per_frame, dinov3_embed_dim]
-            out = self.projection(patch_tokens).reshape(batch_size, seq_len * self.patches_per_frame, self.embed_dim)
-            
-        else:  # "both"  
-            patch_tokens, cls_tokens = self._extract_tokens(x)
-            # Combine CLS + patches for each frame: [batch*seq_len, 1+patches_per_frame, dinov3_embed_dim]
-            combined = torch.cat([cls_tokens, patch_tokens], dim=1)
-            out = self.projection(combined).reshape(batch_size, seq_len * (1 + self.patches_per_frame), self.embed_dim)
+        # Process DINOv3 features
+        out = self._forward_processor(x, batch_size, seq_len)
 
         # Prepend learnable CLS token and apply transformer
         learnable_cls = self.cls_token.expand(batch_size, 1, -1)
