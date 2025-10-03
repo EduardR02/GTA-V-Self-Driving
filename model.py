@@ -35,10 +35,8 @@ class EfficientTransformerBlock(nn.Module):
         self.use_flash_attn = FLASH_ATTN_AVAILABLE
         self.cls_attention_only = cls_attention_only
         
-        # Keep the same parameter initialization for both implementations
-        self.q_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.k_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.v_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        # Packed QKV projection (single matrix for better performance)
+        self.qkv_proj = nn.Linear(hidden_size, hidden_size * 3, bias=False)
         self.out_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.use_dropout = dropout > 0
         if self.use_dropout:
@@ -52,9 +50,8 @@ class EfficientTransformerBlock(nn.Module):
         self.hidden_dim = int(2 * self.hidden_dim / 3)  # to keep param count roughly same as normal 4 * hidden_size (with swiglu we need ffn matrices instead of one)
         self.hidden_dim = self.multiple_of * ((self.hidden_dim + self.multiple_of - 1) // self.multiple_of)      # round up to multiple_of
         
-        self.mlp_linear_1 = nn.Linear(self.hidden_size, self.hidden_dim, bias=False)
-        self.mlp_linear_2 = nn.Linear(self.hidden_size, self.hidden_dim, bias=False)
-        self.mlp_linear_3 = nn.Linear(self.hidden_dim, self.hidden_size, bias=False)
+        self.mlp_linear_13 = nn.Linear(self.hidden_size, self.hidden_dim * 2, bias=False)
+        self.mlp_linear_2 = nn.Linear(self.hidden_dim, self.hidden_size, bias=False)
         
         # RoPE (Rotary Position Embedding)
         self.rope = RotaryPositionalEmbeddings(self.head_dim, max_seq_len=max_seq_len)
@@ -73,9 +70,10 @@ class EfficientTransformerBlock(nn.Module):
         else:
             self.forward = self._forward_full
 
-    def swiglu_mlp(self, x):
+    def swiglu_mlp_packed(self, x):
         # swiglu(x) = (xW1 + b1) * swish(xW2 + b2), where swish(x) = x * sigmoid(x)
-        return self.mlp_linear_3(F.silu(self.mlp_linear_1(x)) * self.mlp_linear_2(x))
+        x1, x3 = torch.chunk(self.mlp_linear_13(x), 2, dim=-1)
+        return self.mlp_linear_2(F.silu(x1) * x3)
     
     def _flash_attention(self, q, k, v):
         """Flash attention wrapper"""
@@ -90,10 +88,14 @@ class EfficientTransformerBlock(nn.Module):
         norm_x = self.norm1(x)
         batch_size, seq_len, hidden_size = norm_x.shape
         
-        # Only compute query for CLS token, but key/value for all tokens
-        q_cls = self.q_proj(norm_x[:, 0:1]).view(batch_size, 1, self.num_heads, self.head_dim)
-        k = self.k_proj(norm_x).view(batch_size, seq_len, self.num_heads, self.head_dim)
-        v = self.v_proj(norm_x).view(batch_size, seq_len, self.num_heads, self.head_dim)
+        # Compute packed QKV for all tokens once
+        qkv = self.qkv_proj(norm_x)
+        q, k, v = torch.chunk(qkv, 3, dim=-1)
+        
+        # Only use query from CLS token, but key/value from all tokens
+        q_cls = q[:, 0:1].view(batch_size, 1, self.num_heads, self.head_dim)
+        k = k.view(batch_size, seq_len, self.num_heads, self.head_dim)
+        v = v.view(batch_size, seq_len, self.num_heads, self.head_dim)
 
         q_cls = self.rope(q_cls)
         k = self.rope(k)
@@ -105,14 +107,14 @@ class EfficientTransformerBlock(nn.Module):
         return self.post_attention_stuff(x, attn)
     
     def _forward_full(self, x):
-        """Forward pass that computes full attention for all tokens"""
         norm_x = self.norm1(x)
         batch_size, seq_len, hidden_size = norm_x.shape
         
-        # Compute Q, K, V for all tokens
-        q = self.q_proj(norm_x).view(batch_size, seq_len, self.num_heads, self.head_dim)
-        k = self.k_proj(norm_x).view(batch_size, seq_len, self.num_heads, self.head_dim)
-        v = self.v_proj(norm_x).view(batch_size, seq_len, self.num_heads, self.head_dim)
+        qkv = self.qkv_proj(norm_x)
+        q, k, v = torch.chunk(qkv, 3, dim=-1)
+        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim)
+        k = k.view(batch_size, seq_len, self.num_heads, self.head_dim)
+        v = v.view(batch_size, seq_len, self.num_heads, self.head_dim)
 
         # apply rope after view and BEFORE transpose
         q = self.rope(q)
@@ -143,7 +145,7 @@ class EfficientTransformerBlock(nn.Module):
 
         # Residual connection and post-norm MLP
         x = x + attn
-        mlp_out = self.swiglu_mlp(self.norm2(x))
+        mlp_out = self.swiglu_mlp_packed(self.norm2(x))
 
         if self.use_dropout:
             mlp_out = self.dropout(mlp_out)
@@ -330,10 +332,10 @@ class Dinov3ForTimeSeriesClassification(nn.Module):
         self.cls_option = cls_option
 
         # Aggregator params
-        self.num_heads = 8
+        self.num_heads = 6
         self.num_layers = 6
         self.use_dino_embed_size = False
-        self.transformer_dim = 128
+        self.transformer_dim = 96
 
         if use_transformers:
             from transformers import AutoModel
