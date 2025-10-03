@@ -5,7 +5,6 @@ from torchtune.modules import RotaryPositionalEmbeddings
 import os
 
 
-# Add xformers import
 try:
     import xformers.ops as xops
     XFORMERS_AVAILABLE = True
@@ -14,7 +13,6 @@ try:
 except ImportError:
     XFORMERS_AVAILABLE = False
     print("xformers not available")
-# XFORMERS_AVAILABLE = False    # manual xformers override in case it's numerically different, should be fixed now
 try:
     from flash_attn import flash_attn_func
     FLASH_ATTN_AVAILABLE = True
@@ -67,7 +65,7 @@ class EfficientTransformerBlock(nn.Module):
         elif self.use_xformers:
             self.attn_func = self._xformers_attention
         else:
-            self.attn_func = self.normal_attention
+            self.attn_func = self.sdpa
         
         # Bind appropriate forward method based on attention mode
         if cls_attention_only:
@@ -125,15 +123,16 @@ class EfficientTransformerBlock(nn.Module):
         
         return self.post_attention_stuff(x, attn)
     
-    def normal_attention(self, q, k, v):    # slow, fallback
-        # Match xFormers' exact pattern of operations, https://facebookresearch.github.io/xformers/components/ops.html
-        q = q * self.scale
+    def sdpa(self, q, k, v):
+        """PyTorch SDPA fallback - automatically uses optimized kernels when available"""
+        # SDPA expects (batch, heads, seq, head_dim) but we have (batch, seq, heads, head_dim)
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
-        attn = torch.matmul(q, k.transpose(-2, -1))
-        attn = F.softmax(attn, dim=-1)
-        attn = torch.matmul(attn, v)
+        
+        # PyTorch SDPA handles scaling internally
+        attn = F.scaled_dot_product_attention(q, k, v, scale=self.scale)
+        
         return attn.transpose(1, 2).contiguous()
     
     def post_attention_stuff(self, x, attn):
@@ -337,7 +336,7 @@ class Dinov3ForTimeSeriesClassification(nn.Module):
         self.transformer_dim = 128
 
         if use_transformers:
-            from transformers import AutoModel, AutoImageProcessor
+            from transformers import AutoModel
             
             size2hf = {
                 "base": "facebook/dinov3-vitb16-pretrain-lvd1689m",
@@ -345,7 +344,6 @@ class Dinov3ForTimeSeriesClassification(nn.Module):
                 "huge": "facebook/dinov3-vith16-pretrain-lvd1689m",
             }
             
-            self.processor = AutoImageProcessor.from_pretrained(size2hf[self.size])
             self.dinov3 = AutoModel.from_pretrained(
                 size2hf[self.size],
                 device_map="auto",
@@ -377,15 +375,17 @@ class Dinov3ForTimeSeriesClassification(nn.Module):
             self.num_register_tokens = getattr(self.dinov3, 'num_register_tokens', 0)
 
         # Bind specialized token extraction and forward methods based on configuration
+        self.is_patches_only = (cls_option == "patches_only")
+        
         if self.use_transformers:
-            if cls_option == "patches_only":
+            if self.is_patches_only:
                 self._token_extractor = self._extract_tokens_patches_only_transformers
                 self._forward_processor = self._forward_patches_only
             else:  # "both"
                 self._token_extractor = self._extract_tokens_both_transformers
                 self._forward_processor = self._forward_both
         else:
-            if cls_option == "patches_only":
+            if self.is_patches_only:
                 self._token_extractor = self._extract_tokens_patches_only_torch_hub
                 self._forward_processor = self._forward_patches_only
             else:  # "both"
@@ -396,18 +396,16 @@ class Dinov3ForTimeSeriesClassification(nn.Module):
         with torch.no_grad():
             device = next(self.dinov3.parameters()).device
             dummy = torch.randn(1, 3, *self.expected_input_hw, device=device, dtype=dtype)
-            test_output = self._extract_tokens(dummy)
+            test_output = self._token_extractor(dummy)
             
-            if cls_option == "patches_only":
-                self.patches_per_frame = test_output.shape[1]
-            else:  # "both"
-                self.patches_per_frame = test_output[0].shape[1]
+            self.patches_per_frame = test_output.shape[1] if self.is_patches_only else test_output[0].shape[1]
             
             del dummy, test_output
             if device.type == 'cuda':
                 torch.cuda.empty_cache()
 
         print(f"DINOv3 {size}: {self.dinov3_embed_dim}D, {self.patches_per_frame} patches/frame, cls_option={cls_option}")
+        print(f"Training context: {self.max_frames} frames = ~{1 + self.patches_per_frame * self.max_frames + (self.max_frames if not self.is_patches_only else 0)} tokens")
 
         pos_weights = torch.tensor([1.0, 11.285, 25.556/2, 11.392])
         self.loss_fct = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weights)
@@ -421,11 +419,19 @@ class Dinov3ForTimeSeriesClassification(nn.Module):
         self.projection = nn.Linear(self.dinov3_embed_dim, self.embed_dim) if self.dinov3_embed_dim != self.embed_dim else nn.Identity()
         self.cls_token = nn.Parameter(torch.randn(1, 1, self.embed_dim))
 
-        # Calculate context length based on configuration
-        if cls_option == "patches_only":
-            context_length = 1 + self.patches_per_frame * self.max_frames  # learnable CLS + all patches
-        else:  # "both"  
-            context_length = 1 + self.max_frames + self.patches_per_frame * self.max_frames  # learnable CLS + frame CLS + all patches
+        # Calculate context length for current training config
+        context_length = 1 + self.patches_per_frame * self.max_frames
+        if not self.is_patches_only:
+            context_length += self.max_frames  # Add frame CLS tokens
+        
+        # Set RoPE to support more frames for future extension without retraining
+        # Use FIXED maximum to ensure checkpoint compatibility when changing max_frames
+        MAX_FRAMES_SUPPORTED = 10  # Fixed value - same for all checkpoints regardless of training frames
+        rope_max_seq_len = 1 + self.patches_per_frame * MAX_FRAMES_SUPPORTED
+        if not self.is_patches_only:
+            rope_max_seq_len += MAX_FRAMES_SUPPORTED
+        
+        print(f"RoPE supports up to {MAX_FRAMES_SUPPORTED} frames ({rope_max_seq_len} tokens) for future extension")
 
         self.transformer = EfficientTransformer(
             hidden_size=self.embed_dim,
@@ -433,7 +439,7 @@ class Dinov3ForTimeSeriesClassification(nn.Module):
             num_layers=self.num_layers,
             dropout=dropout_rate,
             use_xformers=True,
-            max_seq_len=context_length
+            max_seq_len=rope_max_seq_len
         )
 
         self.fc_head = nn.Linear(self.embed_dim, num_classes)
@@ -468,19 +474,15 @@ class Dinov3ForTimeSeriesClassification(nn.Module):
         cls_tokens = cls_tokens.unsqueeze(1)  # [batch*seq_len, 1, embed_dim]
         return patch_tokens, cls_tokens
     
-    def _extract_tokens(self, x):
-        """Route to appropriate token extraction method"""
-        return self._token_extractor(x)
-
     def _forward_patches_only(self, x, batch_size, seq_len):
         """Process frames with patch tokens only"""
-        patch_tokens = self._extract_tokens(x)  # [batch*seq_len, patches_per_frame, dinov3_embed_dim]
+        patch_tokens = self._token_extractor(x)  # [batch*seq_len, patches_per_frame, dinov3_embed_dim]
         out = self.projection(patch_tokens).reshape(batch_size, seq_len * self.patches_per_frame, self.embed_dim)
         return out
     
     def _forward_both(self, x, batch_size, seq_len):
         """Process frames with both CLS and patch tokens"""
-        patch_tokens, cls_tokens = self._extract_tokens(x)
+        patch_tokens, cls_tokens = self._token_extractor(x)
         # Combine CLS + patches for each frame: [batch*seq_len, 1+patches_per_frame, dinov3_embed_dim]
         combined = torch.cat([cls_tokens, patch_tokens], dim=1)
         out = self.projection(combined).reshape(batch_size, seq_len * (1 + self.patches_per_frame), self.embed_dim)
@@ -501,8 +503,8 @@ class Dinov3ForTimeSeriesClassification(nn.Module):
 
         loss = None
         if labels is not None:
-            last_label = labels[:, -1, :]
-            loss = self.loss_fct(out.view(-1, self.num_classes), last_label.view(-1, self.num_classes))
+            last_label = labels[:, -1]
+            loss = self.loss_fct(out, last_label)
         
         return out, loss
 
