@@ -63,7 +63,7 @@ class H5Dataset(Dataset):
         self.train_transform_with_zoom = A.Compose([
             A.Affine(scale=(1.05, 1.2), p=self.zoom_prob),
             color_jitter_replace,
-            # RandomSkyMask(height_limit=(0.3, 0.4), p=0.75),
+            RandomSkyMask(height_limit=(0.3, 0.4), p=0.25),
         ], additional_targets=additional_targets)
 
     def _create_lookup_table(self):
@@ -73,14 +73,17 @@ class H5Dataset(Dataset):
         seq_len = 1 if not hasattr(self, 'sequence_len') else self.sequence_len
         seq_stride = 0 if not hasattr(self, 'sequence_stride') else self.sequence_stride
         effective_sequence_length = (seq_len - 1) * seq_stride + self.label_shift
+        # precompute per-file stuck start offsets, align with self.data_files
+        self._stuck_offsets = []
         for file_path in self.data_files:
+            stuck_start = _compute_stuck_start_idx(file_path)
+            self._stuck_offsets.append(stuck_start)
             with h5py.File(file_path, 'r', libver='latest', swmr=True) as f:
                 file_samples = f['labels'].shape[0]
                 file_samples -= effective_sequence_length
                 if "stuck" in file_path:
-                    # this is a bit confusing, but we only have to account for the shorter than amt_remove_after_pause
-                    # case (otherwise -0), because we handle the case if it's longer with the sequence_len > 1 case
-                    file_samples -= max(config.amt_remove_after_pause - effective_sequence_length, 0)
+                    # cut away everything before the first correct 's' frame
+                    file_samples -= max(stuck_start - effective_sequence_length, 0)
                 if file_samples <= 0:
                     print(f"Skipping and removing {file_path} as it has {file_samples} samples (no valid samples)")
                     self.data_files.remove(file_path)
@@ -107,7 +110,8 @@ class H5Dataset(Dataset):
         file_path = self.data_files[file_idx]
 
         if "stuck" in file_path:
-            local_idx += config.amt_remove_after_pause - self.label_shift
+            start_k = self._stuck_offsets[file_idx]
+            local_idx += max(start_k - self.label_shift, 0)
 
         with h5py.File(file_path, 'r', libver='latest', swmr=True) as f:
             image = f['images'][local_idx]
@@ -201,7 +205,8 @@ class TimeSeriesDataset(H5Dataset):
         file_path = self.data_files[file_idx]
         sequence_range = (self.sequence_len - 1) * self.sequence_stride
         if "stuck" in file_path:
-            local_idx += max(config.amt_remove_after_pause - sequence_range - self.label_shift, 0)
+            start_k = self._stuck_offsets[file_idx]
+            local_idx += max(start_k - sequence_range - self.label_shift, 0)
         with h5py.File(file_path, 'r', libver='latest', swmr=True) as f:
             # Get sequence with stride
             img_indices = range(local_idx, local_idx + self.sequence_len * self.sequence_stride, self.sequence_stride)
@@ -325,7 +330,7 @@ additional_targets = {f'image{i}': 'image' for i in range(1, config.sequence_len
 
 train_transform_no_zoom = A.Compose([
     color_jitter_replace,
-    # RandomSkyMask(height_limit=(0.3, 0.4), p=0.75),
+    RandomSkyMask(height_limit=(0.3, 0.4), p=0.25),
 ], additional_targets=additional_targets)
 
 
@@ -335,6 +340,23 @@ transform = A.Compose([
     ToTensorV2(),
 ])
 
+
+def _compute_stuck_start_idx(file_path):
+    """
+    Return the first index >= config.amt_remove_after_pause where label 's' occurs.
+    If the file is not a stuck file, return 0. If no 's' is found, return base.
+    """
+    if "stuck" not in file_path:
+        return 0
+    outputs_s_idx = config.outputs.get("s", 2)
+    with h5py.File(file_path, 'r', libver='latest', swmr=True) as f:
+        num_labels = f['labels'].shape[0]
+        base = min(config.amt_remove_after_pause, num_labels)
+        if base >= num_labels:
+            return base
+        s_col = np.array(f['labels'][base:, outputs_s_idx])
+        s_hits = np.where(s_col == 1)[0]
+        return base + int(s_hits[0]) if s_hits.size > 0 else base
 
 def get_dataloader(data_dir, batch_size, train_split, is_train, classifier_type, sequence_len=1, 
                   sequence_stride=1, flip_prob=0., warp_prob=0., zoom_prob=0., shift_labels=True, shuffle=True,
@@ -384,7 +406,34 @@ def test_dataloader():
                 print(label[i])
                 plt.imshow(img)
                 plt.show()
+  
+    
+def test_stuck_offsets_and_getitem():
+    data_dirs = [config.stuck_data_dir_name]
+    # Build a normal dataloader (batch_size=1, no shuffle for deterministic indexing)
+    loader = get_dataloader(data_dirs, batch_size=1, train_split=1.0, is_train=True, classifier_type="bce", shuffle=False, num_workers=0)
+    dataset = loader.dataset
+    print(f"Total samples: {len(dataset)} across {len(dataset.data_files)} files")
+    print("Per-file first-correct indices and getitem checks (single frame):")
+    for i, fp in enumerate(dataset.data_files):
+        offset = dataset._stuck_offsets[i] if hasattr(dataset, '_stuck_offsets') else 0
+        start_global_idx = 0 if i == 0 else dataset.lookup_table[i - 1]
+        _, label = dataset[start_global_idx]
+        s_val = int(label[2]) if label.ndim == 1 else int(label[..., 2])
+        print(f"{i}: {fp} | offset={offset} | first_global_idx={start_global_idx} | label_s={s_val}")
+
+    # TimeSeries check
+    ts_dataset = TimeSeriesDataset(data_dirs, train_split=1.0, is_train=True, classifier_type="bce", flip_prob=0.0, warp_prob=0.0, zoom_prob=0.0,
+                                   sequence_len=config.sequence_len, sequence_stride=config.sequence_stride, shift_labels=True)
+    print("Per-file first-correct indices and getitem checks (time series):")
+    for i, fp in enumerate(ts_dataset.data_files):
+        offset = ts_dataset._stuck_offsets[i] if hasattr(ts_dataset, '_stuck_offsets') else 0
+        start_global_idx = 0 if i == 0 else ts_dataset.lookup_table[i - 1]
+        _, labels = ts_dataset[start_global_idx]
+        s_val_last = int(labels[-1][2])
+        print(f"{i}: {fp} | offset={offset} | first_global_idx={start_global_idx} | last_label_s={s_val_last}")
 
 
 if __name__ == '__main__':
-    test_dataloader()
+    test_stuck_offsets_and_getitem()
+  
