@@ -1,9 +1,20 @@
 # GTA V Self-Driving
 
+A self-driving AI in GTA V, trained on roughly 1.5 hours of human driving data. It uses **only the raw game images** to drive — purely vision-based, no access to game state, speed, coordinates, or any other data. The model is a frozen DINOv3 vision backbone with a small Transformer on top, trained to predict key presses (W, A, S, D) from short sequences of frames.
+
+For more details, source code, and training instructions, see below.
 
 ## Demo
-- TODO: add driving videos here, one without cars on the road, one with, 
-and one with some interesting moments like getting unstuck, hard turns, etc.
+
+[![15 minutes of autonomous driving in GTA V](https://img.youtube.com/vi/wHBGDzz84-M/maxresdefault.jpg)](https://www.youtube.com/watch?v=wHBGDzz84-M)
+
+**[AI Drives GTA V for 15 Minutes Straight — Trained on ~1.5 Hours of Gameplay](https://www.youtube.com/watch?v=wHBGDzz84-M)**
+
+This entire 15-minute run is fully uninterrupted — I did not help or intervene at any point. The only thing I did was briefly pause to set the next waypoint on the minimap once it reached the previous one.
+
+The training data was driven "like a GTA player" — fast, aggressive, constantly overtaking. The model picks up on this and drives the same way. It frequently crashes but usually recovers on its own.
+
+It starts in the city, gets onto the highway, does nearly the full GTA V highway loop around the map, drives back into the city, almost gets stuck but recovers on its own, heads back out to the highway, and eventually gets into an unlucky crash that pushes it onto a weird side road where it stops moving.
 
 ## Model
 A frozen **DINOv3** ViT backbone feeds patch tokens through a linear projection down to a smaller embedding dimension, 
