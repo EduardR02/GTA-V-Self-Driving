@@ -1,4 +1,4 @@
-# GTA V LSTM
+# GTA V Self-Driving
 
 
 ## Demo
@@ -6,19 +6,48 @@
 and one with some interesting moments like getting unstuck, hard turns, etc.
 
 ## Model
-I am using a frozen dinov2 backbone (base size, becuase small has worse features and large takes too long to train and inference, about 2x base) with some cnn layers on top followed by an RNN (LSTM) and a final 
-linear layer for the four output classes (w, a, s, d), with some layernorms interspersed.
-I used BCE Loss so that each class is predicted independently.
+A frozen **DINOv3** ViT backbone feeds patch tokens through a linear projection down to a smaller embedding dimension, 
+followed by a custom **Transformer** temporal aggregator with **Rotary Positional Embeddings (RoPE)** and **SwiGLU** MLPs, 
+and a final linear classification head for the four output classes (W, A, S, D).
+BCE Loss is used so that each class is predicted independently.
 
-## RNN vs no RNN
+### Architecture details
+- **Backbone**: DINOv3 ViT (16x16 patches), frozen. Configurable size (base/large/huge). Loaded via `torch.hub` from a local clone or HuggingFace Transformers.
+- **Projection**: Linear layer from DINOv3 embeddings down to a smaller transformer dimension.
+- **Temporal aggregator**: A small Transformer with RMSNorm, RoPE, SwiGLU MLP, and a learnable CLS token prepended to the full sequence of patch tokens from all 3 frames. The last transformer layer only computes attention for the CLS token as an optimization, since only the CLS representation is used for classification. Uses Flash Attention or xFormers when available, falls back to PyTorch SDPA. The exact depth, width, and head count are still being experimented with — smaller aggregators don't overfit but seem to lose something, while larger ones overfit. It's unclear what works best here.
+- **Classification head**: Single linear layer from the CLS token to 4 outputs.
+- **Input**: 3 frames. Resolution doesn't really matter (padding handles patch alignment), the current 240x180 is just what the training data was originally recorded at.
+
+## Evolution from LSTM to Transformer
+
+The model started as a frozen **DINOv2** backbone (base, 14x14 patches) with some CNN layers on top, followed by an **LSTM** and a linear head. 
+This worked, but the LSTM's sequential nature limited what the model could learn from the frame sequence.
+
+The current version replaces all of that post-backbone processing with a Transformer aggregator. This has several advantages:
+- The Transformer sees all patch tokens from all frames simultaneously, rather than getting a single pooled vector per frame.
+- RoPE gives smooth positional awareness across the full token sequence without learned position embeddings.
+- SwiGLU and RMSNorm are more modern and stable than the original LayerNorm + GELU setup.
+- The CLS-only attention optimization in the last layer saves compute without hurting quality.
+
+The backbone was also upgraded from DINOv2 (14x14 patches) to DINOv3 (16x16 patches), which slightly changes the input resolution requirements but gives better features.
+
+## Training
+
+- **Optimizer**: [Muon](https://github.com/KellerJordan/Muon) (`SingleDeviceMuonWithAuxAdam`) for the transformer aggregator weights, AdamW for the backbone, projection, head, and all biases/norms.
+- **Scheduling**: Cosine decay with linear warmup. Positive class weights for BCE loss are scheduled during training to handle class imbalance (steering and braking are much rarer than accelerating).
+- **Mixed precision**: bfloat16 (preferred) or float16 with GradScaler.
+- **Gradient accumulation**: Used to simulate larger effective batch sizes.
+- **`torch.compile`**: Enabled for speed.
+
+## RNN vs no RNN (historical)
 The issue with not having some kind of sequence as input is that the model cannot judge its speed and current steering.
 This makes the forward vs backward distinction button almost noise, and because the training data has MUCH more forward, 
 the backward examples are essentially noise. Another problem that this model has is that it cannot regulate its speed, 
 so when it drives in the city it might simply adjust its confidence in the forward prediction overall based on the 
 "scenery", instead of its speed (because it would have seen many "no press" examples in scenery matching the city).
 
-Using an RNN, (LSTM or GRU) fixes most of this. You could also probably just use a linear layer instead that takes in
-your sequence concatenated.
+Using an RNN (or now a Transformer) fixes most of this. The Transformer is strictly better here because it can attend 
+to all patches across all frames simultaneously, rather than receiving a pooled summary per frame.
 
 ## Proportional outputs during inference
 This works incredibly well, and I am sad that I did not do this earlier. By simply taking the steering delta,
@@ -61,11 +90,18 @@ which tells us where to go, and is always in the same place. So for distorting o
 the area of the minimap, do the augmentation, and then put the minimap back in its original place and size. This also 
 makes it harder for the model to "cheat" by looking at the minimap becoming "weird", and not adapting to those examples.
 
+Current augmentations (via Albumentations):
+- **Diagonal warp**: Simulates lateral drift/recovery and updates labels to "steer back".
+- **Minimap protection**: Extract minimap, inpaint the area, apply spatial transforms, re-insert minimap.
+- **Color jitter**, **random sky mask** (blacks out top of image), **horizontal flip** (with label swapping A↔D), and **zoom**.
+
 ## Shifting labels
 It makes sense to account for the time it takes for the model to predict the output at inference time during training.
 First of all, not doing this makes it so the models predictions are always behind by that time,
 and secondly this will make the models input during inference look more out of distribution, because 
 it creates its own past during inference, which will be driven "with lag" and look different from the training data.
+
+Labels are shifted by `round(fps_at_recording / fps_at_test)` frames.
 
 ## Using only CLS token
 It is hard to describe, but when I tried it just did not work. When driving, the model looks blind.
@@ -85,8 +121,9 @@ Stats:
     - with a waypoint on the minimap
     - with hood camera (and invisible car so that the hood does not block the lower part of the screen)
     - sunny weather
+- data is stored in HDF5 (`.h5`) files containing `images` (uint8) and `labels` (float32)
 
-Unfortunately at the time of recording the data I did not record each button press seperately, but predetermined classes, as follows, of which only a single class could be true at once:
+Unfortunately at the time of recording the data I did not record each button press separately, but predetermined classes, as follows, of which only a single class could be true at once:
 - w, a, s, d, wa, wd, no press  
 
 This means that to use them for training now, I had to first convert these (imperfect) recordings into:
@@ -100,7 +137,7 @@ When recording this data, I waited at the start to "pad" for sequence length, so
 This causes an issue when training, because the "padding" data is junk, therefore you want to skip it (in case you shorten your sequence length or train without sequences). So my pytorch dataset and dataloaders are able to account for this type of data. Just make sure if you create this type of data you either keep the padding consistent, or record the exact padding amount for each example.
 
 ## Dataset and Dataloader
-The dataset and dataloader I made can account for:
+The dataset and dataloader can account for:
 - shifting labels
 - stuck type data
 - special augmentations (with the minimap)
@@ -109,8 +146,27 @@ The dataset and dataloader I made can account for:
 - training and validation split
 - multiple data directories
 
+## Inference
+- Screen capture via `mss` at 800x600 from a fixed monitor region.
+- A `deque` buffer stores timestamped frames; `select_images` picks frames closest to the training stride to match temporal spacing.
+- **Steering (A/D)**: Proportional — key press duration scales with the model's confidence within the current frame time. If both A and D are predicted, only the stronger one is kept.
+- **Speed (W/S)**: Binary — on/off based on a threshold.
+
+## Tech Stack
+| Component | Technology |
+|-----------|-----------|
+| Backbone | DINOv3 ViT (16x16 patches), frozen |
+| Temporal aggregator | Custom Transformer with RoPE + SwiGLU |
+| Attention | Flash Attention / xFormers / PyTorch SDPA |
+| Optimizer | Muon + AdamW |
+| Mixed precision | bfloat16 |
+| Data format | HDF5 |
+| Augmentations | Albumentations |
+| Screen capture | mss |
+| Framework | PyTorch |
+
 ## Usage
-- TODO: add a requirements.txt, maybe add ckpt.pt
+- Install dependencies: `pip install -r requirements.txt` (also needs `torch` and optionally `flash-attn` / `xformers`)
 - For trying it out, use the provided checkpoint, open the game in 800x600 resolution, and place it at the top left corner of the screen.
 - TODO: add simply detecting the window instead of careful placement
 - Use hood camera, make your car invisible, set sunny weather
