@@ -12,7 +12,7 @@ import psutil
 from tqdm import tqdm
 
 
-current_data_dirs = [config.stuck_data_dir_name, config.turns_data_dir_name, config.new_data_dir_name]  # has to be list
+current_data_dirs = [config.stuck_data_dir_name, config.new_data_dir_name]  # has to be list
 
 # Get the current process
 process = psutil.Process(os.getpid())
@@ -21,9 +21,8 @@ process.nice(psutil.HIGH_PRIORITY_CLASS)
 print(torch.backends.cudnn.version())
 print(torch.version.cuda)
 # -----------------------------------------------------------------------------
-# default config values designed to train a gpt2 (124M) on OpenWebText
-# I/O
-out_dir = os.path.join('models', 'dinov3')
+
+out_dir = os.path.join('models', 'experiments')
 eval_interval = 1000
 log_interval = 10
 eval_iters = 10
@@ -34,48 +33,45 @@ freeze_non_dino_layers = False
 init_from = 'scratch' # 'scratch' or 'resume'
 dino_size = "base"  # small is ~21M, base ~86M, large ~300M, giant ~1.1B
 use_dino_registers = True
-load_checkpoint_name = "v3_base_12layer.pt"
-save_checkpoint_name = "v3_base_12layer.pt"
-metrics_name = "v3_base_12layer.png"
+load_checkpoint_name = "v3_base_12_64_swiglu_latest_10k.pt"
+save_checkpoint_name = "exp_2L128_reg_stride10.pt"
+metrics_name = "exp_2L128_reg_stride10.png"
 gradient_accumulation_steps = 1 # used to simulate larger batch sizes
-batch_size = 128    # if gradient_accumulation_steps > 1, this is the micro-batch size
+batch_size = 256    # if gradient_accumulation_steps > 1, this is the micro-batch size
 train_split = 0.95   # test val split, keep same for resume
 convert_to_greyscale = False
 sequence_len = 3
-sequence_stride = 20
+sequence_stride = 10
 flip_prob = 0.33
 warp_prob = 0.1
 zoom_prob = 0.3
-dropout_p = 0.1     # 0 to disable
+dropout_p = 0.25     # 0 to disable
 classifier_type = "bce" # "cce" or "bce"
 restart_schedules = False
 cls_option = "both"    # "cls_only", "both", or "patches_only"
-shift_labels = False
+# Architecture (passed to model)
+transformer_dim = 128
+num_layers = 2
+num_heads = 4
+label_smoothing = 0.0  # 0 to disable, 0.05 recommended
+shift_labels = True
 show_per_class_during_training = True
 
 # adamw optimizer
-learning_rate = 3e-4 # max learning rate
+learning_rate = 5e-5 # max learning rate    (when adding muon best learning area was around 2e-5)
 # Global Muon learning rate (used for param groups with use_muon=True)
-muon_learning_rate = 0.02   # 0.02 is recommended by Muon
-max_iters = 100000 # total number of training iterations
+muon_learning_rate = 0.0015   # 0.02 is recommended by Muon
+max_iters = 6000 # total number of training iterations
 # optimizer settings
 weight_decay = 0.075
 beta1 = 0.9
 beta2 = 0.995
-grad_clip = 0.0 # clip gradients at this value, or disable if == 0.0
+grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
-warmup_iters = 1000 # how many steps to warm up for
-lr_decay_iters = 60000 # should be ~= max_iters per Chinchilla
-min_lr = 1e-6 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
-# pos_weights scheduling settings  
-schedule_pos_weights = False # whether to schedule pos_weights during training
-pos_warmup_iters = 1000 # how many steps to use no pos_weights (same as lr warmup)
-pos_decay_iters = 60000 # when to finish ramping up pos_weights (same as lr)
-start_pos_weights = [1.0, 1.0, 1.0, 1.0] # starting weights (no bias)
-end_pos_weights = [0.585, 11.285, 25.556, 11.392] # ending weights (calculated from data)
-# DDP settings
-backend = 'nccl' # 'nccl', 'gloo', etc.
+warmup_iters = 500 # how many steps to warm up for
+lr_decay_iters = 5500 # should be ~= max_iters per Chinchilla
+min_lr = 3e-6 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 # change this to bf16 if your gpu actually supports it
@@ -97,6 +93,7 @@ else:
 torch.manual_seed(1337)
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
+torch.backends.cudnn.benchmark = True
 device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
 # note: float16 data type will automatically use a GradScaler
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
@@ -167,12 +164,17 @@ def check_fp16_conversion_issues(model):
 
 
 def load_model(sample_only=False):
-    global model, optimizer, scaler, iter_num, best_val_loss, iter_num_on_load
+    global model, optimizer, scaler, iter_num, best_val_loss, iter_num_on_load, init_from
     checkpoint = None
+    init_from = 'resume' if sample_only else init_from
     if init_from == 'scratch':
         print("Initializing a new model from scratch")
         if config.use_dinov3:
-            model = Dinov3ForTimeSeriesClassification(dino_size, len(id2label), dropout_rate=dropout_p, dtype=ptdtype, cls_option=cls_option)
+            model = Dinov3ForTimeSeriesClassification(
+                dino_size, len(id2label), dropout_rate=dropout_p, dtype=ptdtype,
+                cls_option=cls_option, num_heads=num_heads, num_layers=num_layers,
+                transformer_dim=transformer_dim, label_smoothing=label_smoothing
+            )
         else:
             model = Dinov2ForTimeSeriesClassification(dino_size, len(id2label), classifier_type=classifier_type, cls_option=cls_option, use_reg=use_dino_registers, dropout_rate=dropout_p)
     elif init_from == 'resume':
@@ -180,7 +182,11 @@ def load_model(sample_only=False):
         ckpt_path = os.path.join(out_dir, load_checkpoint_name)
         checkpoint = torch.load(ckpt_path, map_location=device)
         if config.use_dinov3:
-            model = Dinov3ForTimeSeriesClassification(dino_size, len(id2label), dropout_rate=dropout_p, dtype=ptdtype, cls_option=cls_option)
+            model = Dinov3ForTimeSeriesClassification(
+                dino_size, len(id2label), dropout_rate=dropout_p, dtype=ptdtype,
+                cls_option=cls_option, num_heads=num_heads, num_layers=num_layers,
+                transformer_dim=transformer_dim, label_smoothing=label_smoothing
+            )
         else:
             model = Dinov2ForTimeSeriesClassification(dino_size, len(id2label), classifier_type=classifier_type, cls_option=cls_option, use_reg=use_dino_registers, dropout_rate=dropout_p)
         state_dict = checkpoint['model']
@@ -381,36 +387,48 @@ def _compute_per_class_metrics(preds, labels):
     
     return per_class_total_acc, per_class_recall, per_class_specificity
 
+def _extract_final_labels_t(labels, seq_len):
+    """Extract final labels from sequence if needed (torch tensor version)"""
+    if seq_len > 1:
+        return labels[:, -1, :]
+    return labels
+
 @torch.no_grad()
 def calc_accuracy(logits, labels, return_per_class=False):
-    """Calculate accuracy metrics with optional per-class breakdown"""
-    # Convert logits to predictions
-    preds = logits.detach().cpu().float()
-    
+    """Calculate accuracy metrics with optional per-class breakdown.
+    Works with both GPU and CPU tensors."""
     if classifier_type == "bce":
-        # Binary classification with sigmoid
-        preds = torch.nn.functional.sigmoid(preds).numpy() >= 0.5
-        labels = labels.detach().cpu().numpy().astype(bool)
-        labels = _extract_final_labels(labels, sequence_len)
+        # Keep computation on whatever device logits are on
+        preds = (torch.sigmoid(logits.detach().float()) >= 0.5)
         
-        # Overall exact match accuracy
-        exact_match_acc = np.mean(np.all(preds == labels, axis=-1))
+        # Ensure labels is a tensor and on same device as preds
+        if not isinstance(labels, torch.Tensor):
+            labels = torch.tensor(labels)
+        labels_bool = labels.to(device=preds.device, dtype=torch.bool)
+        labels_bool = _extract_final_labels_t(labels_bool, sequence_len)
+        
+        # Overall exact match accuracy (all classes must match)
+        exact_match_acc = (preds == labels_bool).all(dim=-1).float().mean().item()
         
         if return_per_class:
-            per_class_metrics = _compute_per_class_metrics(preds, labels)
+            # Per-class metrics need numpy - move minimal data
+            preds_np = preds.cpu().numpy()
+            labels_np = labels_bool.cpu().numpy()
+            per_class_metrics = _compute_per_class_metrics(preds_np, labels_np)
             return exact_match_acc, per_class_metrics
         return exact_match_acc
-        
     else:
-        # Multi-class classification with argmax
-        preds = torch.argmax(preds, dim=-1).numpy()
-        labels = labels.detach().cpu().numpy()
-        labels = _extract_final_labels(labels, sequence_len)
-        labels = np.argmax(labels, axis=-1)
+        preds = torch.argmax(logits.detach().float(), dim=-1)
         
-        exact_match_acc = np.mean(preds == labels)
+        if not isinstance(labels, torch.Tensor):
+            labels = torch.tensor(labels)
+        labels_t = labels.to(device=preds.device)
+        labels_t = _extract_final_labels_t(labels_t, sequence_len)
+        labels_t = torch.argmax(labels_t, dim=-1)
+        
+        exact_match_acc = (preds == labels_t).float().mean().item()
         if return_per_class:
-            return exact_match_acc, None  # CCE per-class metrics not implemented
+            return exact_match_acc, None
         return exact_match_acc
 
 
@@ -569,27 +587,6 @@ def get_lr(it):
     return min_lr + coeff * (learning_rate - min_lr)
 
 
-def get_pos_weights(it):
-    # pos_weights scheduler (cosine annealing from no bias to full data-driven weights)
-    if not schedule_pos_weights:
-        return torch.tensor(end_pos_weights)
-    
-    start_weights = torch.tensor(start_pos_weights)
-    end_weights = torch.tensor(end_pos_weights)
-    
-    # 1) linear warmup for pos_warmup_iters steps (keep at start_weights)
-    if it < pos_warmup_iters:
-        return start_weights
-    # 2) if it > pos_decay_iters, return end weights
-    if it > pos_decay_iters:
-        return end_weights
-    # 3) in between, use cosine annealing from start to end weights
-    decay_ratio = (it - pos_warmup_iters) / (pos_decay_iters - pos_warmup_iters)
-    assert 0 <= decay_ratio <= 1
-    coeff = 0.5 * (1.0 - math.cos(math.pi * decay_ratio))  # Note: 1 - cos for increasing
-    return start_weights + coeff * (end_weights - start_weights)
-
-
 def get_batch(dataloader_iter, split):
     try:
         x, y = next(dataloader_iter)
@@ -628,14 +625,6 @@ def _update_learning_rate(current_lr, iter_num, optimizer):
                 param_group['lr'] = learning_rate
     return current_lr
 
-def _update_pos_weights(model, iter_num):
-    """Update pos_weights in the model's loss function"""
-    if schedule_pos_weights:
-        current_pos_weights = get_pos_weights(iter_num).to(device)
-        model.loss_fct.pos_weight = current_pos_weights
-        return current_pos_weights
-    return None
-
 def _collect_evaluation_metrics(losses_and_accs, metrics_dict, local_iter_num):
     """Collect and store evaluation metrics efficiently"""
     metrics_dict["val_losses"].append(losses_and_accs["val"])
@@ -667,8 +656,6 @@ def train_loop():
     while True:
         # Update learning rate efficiently
         current_lr = _update_learning_rate(current_lr, iter_num, optimizer)
-        # Update pos_weights efficiently
-        current_pos_weights = _update_pos_weights(model, iter_num)
 
         # evaluate the loss on train/val sets and write checkpoints
         if iter_num % eval_interval == 0 and iter_num != iter_num_on_load and iter_num != 0:
@@ -703,15 +690,14 @@ def train_loop():
         if iter_num == 0 and eval_only:
             break
 
-        accumulated_loss = 0.0
-        # Accumulate for batch accuracy computation (more efficient than per-step)
+        loss_accum_t = None  # accumulate loss as device tensor; convert once after step
         if gradient_accumulation_steps == 1:
             # Optimized path for no gradient accumulation
             with ctx:
                 logits, loss = model(X, labels=Y)
             # immediately async prefetch next batch while model is doing the forward pass on the GPU
             X, Y, next_y_cpu, dataloader_iter = get_batch(dataloader_iter, 'train')
-            accumulated_loss = loss.item()
+            loss_accum_t = loss.detach()
             accuracy = calc_accuracy(logits, Y_CPU)
             Y_CPU = next_y_cpu
             # backward pass, with gradient scaling if training in fp16
@@ -726,17 +712,18 @@ def train_loop():
                     loss = loss / gradient_accumulation_steps   # scale the loss to account for gradient accumulation
                 # immediately async prefetch next batch while model is doing the forward pass on the GPU
                 X, Y, next_y_cpu, dataloader_iter = get_batch(dataloader_iter, 'train')
-                accumulated_loss += loss.item()
+                ld = loss.detach()
+                loss_accum_t = ld if loss_accum_t is None else (loss_accum_t + ld)
                 # Accumulate for batch accuracy calculation
-                train_logits.append(logits.detach().cpu())
-                train_labels.append(Y_CPU)
+                train_logits.append(logits.detach())  # keep on device; move once after loop
+                train_labels.append(Y_CPU)            # already on CPU from get_batch
                 Y_CPU = next_y_cpu
                 # backward pass, with gradient scaling if training in fp16
                 scaler.scale(loss).backward()
             
             # Batch compute accuracy for gradient accumulation case
             if train_logits:
-                stacked_logits = torch.cat(train_logits, dim=0)
+                stacked_logits = torch.cat(train_logits, dim=0).detach().cpu()
                 stacked_labels = torch.cat(train_labels, dim=0)
                 accuracy = calc_accuracy(stacked_logits, stacked_labels)
                 del train_logits, train_labels, stacked_logits, stacked_labels
@@ -755,16 +742,11 @@ def train_loop():
         t1 = time.time()
         dt = t1 - t0
         t0 = t1
+        accumulated_loss = float(loss_accum_t.item()) if torch.is_tensor(loss_accum_t) else 0.0
         metrics_dict["losses"].append(accumulated_loss)
         metrics_dict["accuracy"].append(accuracy)
         if iter_num % log_interval == 0:
-            # Format pos_weights for printing
-            pos_weights_str = ""
-            if current_pos_weights is not None:
-                pw = current_pos_weights.cpu().numpy()
-                pos_weights_str = f", pos_weights: [{pw[0]:.3f}, {pw[1]:.3f}, {pw[2]:.3f}, {pw[3]:.3f}]"
-            
-            print(f"iter {iter_num}: loss {accumulated_loss:.4f}, time {dt*1000:.2f}ms, accuracy {accuracy*100:.3f}%, lr {current_lr:.6f}{pos_weights_str}")
+            print(f"iter {iter_num}: loss {accumulated_loss:.4f}, time {dt*1000:.2f}ms, accuracy {accuracy*100:.3f}%, lr {current_lr:.6f}")
         iter_num += 1
         local_iter_num += 1
 
@@ -856,4 +838,10 @@ def comprehensive_eval(checkpoint_path):
 
 if __name__ == "__main__":
     train_loop()
-    # comprehensive_eval("v3_base_full_balanced-best.pt")
+    # print("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+    # comprehensive_eval("v3_base_2_32_swiglu_latest-best.pt")
+    # comprehensive_eval("v3_base_2_32_swiglu_latest_14k.pt")
+    # comprehensive_eval("v3_base_2_32_swiglu_latest_17k.pt")
+    # comprehensive_eval("v3_base_2_32_swiglu_latest_21k.pt")
+    # comprehensive_eval("v3_base_2_32_swiglu_latest.pt")
+    # print(get_lr(37000))

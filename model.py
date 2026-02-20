@@ -321,7 +321,9 @@ class Dinov2ForTimeSeriesClassification(nn.Module):
 
 class Dinov3ForTimeSeriesClassification(nn.Module):
     def __init__(self, size, num_classes, dropout_rate=0.0, 
-                 repo_dir="dinov3", dtype=torch.bfloat16, cls_option="patches_only", use_transformers=False, use_pos_weights=True):
+                 repo_dir="dinov3", dtype=torch.bfloat16, cls_option="patches_only", 
+                 use_transformers=False, use_pos_weights=True,
+                 num_heads=4, num_layers=2, transformer_dim=32, label_smoothing=0.0):
         super().__init__()
         self.size = size
         self.num_classes = num_classes
@@ -330,12 +332,13 @@ class Dinov3ForTimeSeriesClassification(nn.Module):
         self.max_frames = 3
         self.use_transformers = use_transformers
         self.cls_option = cls_option
+        self.label_smoothing = label_smoothing
 
         # Aggregator params
-        self.num_heads = 6
-        self.num_layers = 6
+        self.num_heads = num_heads
+        self.num_layers = num_layers
         self.use_dino_embed_size = False
-        self.transformer_dim = 96
+        self.transformer_dim = transformer_dim
 
         if use_transformers:
             from transformers import AutoModel
@@ -506,6 +509,8 @@ class Dinov3ForTimeSeriesClassification(nn.Module):
         loss = None
         if labels is not None:
             last_label = labels[:, -1]
+            if self.label_smoothing > 0:
+                last_label = last_label * (1 - self.label_smoothing) + self.label_smoothing * 0.5
             loss = self.loss_fct(out, last_label)
         
         return out, loss
