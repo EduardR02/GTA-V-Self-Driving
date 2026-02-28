@@ -1,99 +1,75 @@
 # AGENTS
 
 ## Project Overview
-- **Goal:** Train a GTA V driving policy that maps screen frames to 4 binary controls: **W/A/S/D**.
-- **Current pipeline:** Screen capture -> frozen **DINOv3 ViT-B16** features -> **Linear(768->128)** projection -> transformer head -> 4-way binary logits.
-- **Current focus:** Optimize the **transformer head on precomputed features** before full end-to-end pipeline tuning.
-- **Experiment intent:** These are **proxy experiments** (frozen projection, no real augmentations). Use them to detect **trends**, not to claim final production metrics.
+- **Goal:** Train a GTA V driving policy mapping screen frames to binary controls `W/A/S/D`.
+- **Pipeline:** screen capture -> frozen `DINOv3 ViT-B16` features -> `Linear(768->128)` projection -> transformer head -> 4 binary logits.
+- **Current focus:** optimize the transformer head on precomputed features before full end-to-end tuning.
+- **Proxy scope:** these runs are trend-finding proxy experiments; projection is frozen during this phase.
+- **Augmentations:** precomputed features already include 10 versions per frame (1 original + 9 augmented); lack of augmentation is not the proxy limitation.
 
 ## Hardware & Environment
-- **Hardware baseline:** RTX 5070 Ti (**Blackwell sm_120**, 16GB VRAM) + 64GB system RAM.
-- **OS/runtime:** Windows. Multiprocessing uses **spawn** (not fork). All DataLoader/memmap code must be spawn-safe and picklable.
-- **Python execution rule:** Always run Python as `uv run python ...`.
+- **Baseline hardware:** RTX 5070 Ti (`Blackwell sm_120`, 16GB VRAM) + 64GB system RAM.
+- **Platform:** Windows with multiprocessing `spawn` (not `fork`); DataLoader and memmap code must be spawn-safe and picklable.
+- **Python execution:** always use `uv run python ...`.
 - **Never use:** `python ...` or `.venv/Scripts/python.exe ...`.
-- **Matplotlib rule:** Use **Agg** backend for any plotting in training/eval paths; Tk backends can crash from worker-thread contexts.
+- **Matplotlib backend:** use `Agg` for training/eval plotting paths.
 
 ## FP8
-- **Preferred precision:** FP8 is preferred on this hardware and is expected to work on sm_120.
+- **Preference:** FP8 is preferred on `sm_120`; BF16 is fallback.
 - **Source of truth:** `fp8_utils.py`.
-- **Required integration points in `feature_training.py`:**
-  - Import FP8 helpers from `fp8_utils.py`.
-  - Call `add_fp8_cli_args(parser)` in arg parser creation.
-  - Call `maybe_enable_fp8(model, ...)` **after model construction**.
-- **Fallback:** BF16 is valid and supported, but FP8 should be the default preference when available.
+- **Required wiring in `feature_training.py`:** import FP8 helpers, call `add_fp8_cli_args(parser)`, call `maybe_enable_fp8(model, ...)` after model construction.
 
 ## File Ownership
 - **Disposable (safe to rewrite):** `feature_training.py`, `fp8_utils.py`, `run_experiments.py`, `test_*.py`.
 - **Established (do not modify):** `model.py`, `training_new.py`, `dataloader.py`, `config.py`, `main.py`, `muon.py`.
 
-## Architecture (`feature_training.py`)
-- **Model shape:** `HeadOnlyModel` consumes 128-d token features.
-- **Optional downprojection:** `Linear(128->model_dim)` when `model_dim` is set.
-- **Head:** `EfficientTransformer` followed by 4 binary output logits.
-- **Best known config:** `--model_dim 64 --num_layers 6 --dropout 0.35` (exp34 baseline).
-- **Class weighting (hard constraint):**
-  - Base `pos_weights` are hardcoded and must remain: `[1.0, 11.285, 25.556/2, 11.392]` for `[W, A, S, D]`.
-  - Allowed tuning is multiplicative scaling only via CLI: `--a_pos_weight_scale`, `--s_pos_weight_scale`, `--d_pos_weight_scale`.
-  - Do not change base constants.
-- **Optimizer policy (hard constraint):**
-  - **Muon** for transformer parameters with `ndim >= 2`.
-  - **AdamW** for everything else.
-  - Do not remove or replace Muon.
+## Architecture Constraints (Hard)
+- **Head shape:** `HeadOnlyModel` consumes `embed_dim=128` token features, optional `Linear(128->model_dim)` downprojection, `EfficientTransformer`, then 4 binary output logits.
+- **Class weighting:** keep hardcoded base `pos_weights` exactly `[1.0, 11.285, 25.556/2, 11.392]` for `[W, A, S, D]`.
+- **Weight tuning:** only multiplicative scaling via `--a_pos_weight_scale`, `--s_pos_weight_scale`, `--d_pos_weight_scale`.
+- **Optimizer split:** `Muon` for transformer parameters with `ndim >= 2`, `AdamW` for everything else; do not remove or replace `Muon`.
 
 ## Data Pipeline (Critical)
-- **Storage format:** 10 precomputed feature files (~22GB each) + `labels.npy`, loaded as memory-mapped arrays.
-- **Windows spawn compatibility requirements:**
-  - Dataset constructor stores only paths/shapes/metadata.
-  - Do not create live memmap objects in constructor.
-  - `__getstate__` must drop memmap handles before pickling.
-  - Memmaps must be opened lazily per worker via `_ensure_memmaps()` (or equivalent).
-- **Sampling behavior requirements:**
-  - Each sample randomly selects one augmentation version (0-9) during training.
-  - Global shuffling uses `randperm` with configurable `shuffle_chunk_size`.
-  - Use batched reads via `__getitems__`.
-  - In `__getitems__`, group by augmentation version and sort frame indices for near-sequential memmap access.
-- **Loader/perf requirements:**
-  - Wrap DataLoader with `AsyncBatchPrefetcher` for asynchronous GPU transfer.
-  - Keep `num_workers=4` for throughput; `num_workers=0` is typically 3-4x slower.
-  - 64GB RAM page-cache growth from memmaps is expected OS cache behavior, not a leak.
+- **Dataset format:** 10 precomputed feature files (~22GB each, 1 original + 9 augmented) plus `labels.npy`, all loaded via memmap.
+- **Spawn-safe memmaps:** constructor stores only paths/shapes/metadata, `__getstate__` drops memmap handles, `_ensure_memmaps()` lazily opens per worker.
+- **Sampling:** each training sample randomly picks augmentation version `0-9`.
+- **Shuffling:** global shuffle via `randperm` + `shuffle_chunk_size`; do not rely on `DataLoader(shuffle=True)`.
+- **Batch reads:** use `__getitems__`; group by augmentation version and sort frame indices for near-sequential memmap access.
+- **Traversal behavior:** full dataset coverage before repeats (epoch-like behavior across all 10 versions).
+- **Loader/perf:** wrap DataLoader with `AsyncBatchPrefetcher`; keep `num_workers=4`; OS page-cache growth into RAM is expected, not a leak.
 
 ## Training Loop
-- **Compile:** Use `torch.compile(model)` for meaningful speedup.
-- **LR schedule:** Custom cosine with warmup via `get_lr()`.
-- **Critical schedule invariant:** `--lr_decay_iters` must equal `--max_iters`.
-  - Default decay is 5000.
-  - If `max_iters` changes, update `lr_decay_iters` to match or training will sit at `min_lr` for the tail.
-- **Warm restarts:** `--lr_restart_cycles` controls SGDR-style cosine restarts (`1` means standard cosine).
-- **AMP scaler rule:** Enable `GradScaler` only for `float16`; do not use it for `bfloat16`.
-- **Effective batch:** Controlled by `--gradient_accumulation_steps`.
+- **Compilation:** use `torch.compile(model)` for throughput.
+- **LR schedule:** custom cosine with warmup via `get_lr()`.
+- **Invariant:** `lr_decay_iters` must always equal `max_iters`.
+- **Warm restarts:** `lr_restart_cycles` controls SGDR-style cosine restarts (`1` = standard cosine).
+- **AMP scaler:** enable `GradScaler` only for `float16`, never for `bfloat16`.
 
 ## Logging
-- **Run config print line must include:** `flat_tokens`, `embed_dim`, `model_dim` (if set), `device`, `dtype`, `fp8 status`, `label_smoothing`.
-- **Experiment logs directory:** `temp/experiment_logs/`.
+- **Run config line must include:** `flat_tokens`, `embed_dim`, `model_dim` (if set), `device`, `dtype`, FP8 status, `label_smoothing`.
+- **Logs directory:** `temp/experiment_logs/`.
 - **Checkpoints directory:** `models/feature_head/`.
-- **Plots:** Save training/validation metric plots next to checkpoints.
+- **Plots:** save training/validation plots alongside checkpoints.
 
 ## Experiment Philosophy
-- Optimize for **balanced control quality** across W/A/S/D; do not overfit to S recall alone.
-- With label smoothing, absolute loss floor is higher by construction; compare LS runs by **generalization behavior**, not raw loss minima.
-- Do not spend time on threshold sweeps in this stage; threshold tuning is for final models.
-- Run high-signal experiments and keep negative results; they still reduce search space.
-- Interpret results mechanistically: prioritize understanding **why** a change helped/hurt.
+- Optimize for balanced control quality across `W/A/S/D`; do not over-index on `S` recall alone.
+- With label smoothing, loss floors rise by design; compare runs by generalization behavior, not raw minimum loss.
+- Do not spend time on threshold sweeps at this stage.
+- Prioritize high-signal experiments and keep negative results.
+- Require mechanism-level reasoning: explain why a change helped or hurt.
 
-## Known Results Summary
-- **Best architecture so far:** 64d / 6 layers (exp34), val_acc ~44.3%, S recall ~64%.
-- **Training status:** exp34 appears under-trained (val_acc exceeds train_acc by ~5 points).
-- **Prior 10K runs invalid:** exp41/exp42 were misconfigured (`max_iters=10000` but `lr_decay_iters=5000`), so half the run was at `min_lr`.
-- **Persistent limit:** A/D steering remains around ~80/80 ceiling across many settings.
-- **Failed interventions:** focal loss, frame dropout, scheduled pos-weight, projection expansion to 256.
-- **Dropout finding:** 0.5 dropout underperforms baseline 0.35.
-- **Performance profile:** training is compute-bound (not IO-bound) with `num_workers=4`.
-- **Muon cost:** Muon is ~40% of step time and remains required.
+## Non-Negotiable Guardrails
+- Preserve spawn-safe lazy memmap semantics.
+- Preserve `Muon` + `AdamW` split by parameter dimensionality.
+- Preserve base class weights exactly; allow multiplicative scaling only.
+- Keep `lr_decay_iters = max_iters` in every run/script.
+- Use `uv run python` for all execution.
+- Keep logs/checkpoints/plots in canonical directories.
 
-## Non-Negotiable Regression Guardrails
-- Preserve data pipeline spawn-safety and lazy memmap semantics.
-- Keep Muon + AdamW split exactly by parameter dimensionality policy.
-- Preserve hardcoded base class weights and only tune via multiplicative scale args.
-- Always align `lr_decay_iters` with `max_iters` in new experiments and scripts.
-- Keep logs/checkpoints/plots in the canonical directories above.
-- Use `uv run python` for all scripts, tests, and experiment orchestration.
+## Known Results (Mutable, Update As Experiments Progress)
+- Best architecture so far: `64d/6L` (`exp34`), `val_acc ~44.3%`, `S recall ~64%`, with signs of under-training.
+- Prior 10K runs (`exp41/exp42`) were misconfigured (`lr_decay_iters=5000`, `max_iters=10000`).
+- `A/D` steering ceiling around `~80/80` has persisted across many settings.
+- Failed interventions so far: focal loss, frame dropout, scheduled pos-weight, projection expansion to `256`, dropout `0.5`.
+- With `num_workers=4`, training is compute-bound.
+- Typical throughput for `64d/6L` + FP8 has been about `75-82 ms/iter`.
