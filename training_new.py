@@ -30,12 +30,12 @@ eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 fine_tune = False   # train the entire model or just the top
 freeze_non_dino_layers = False
-init_from = 'scratch' # 'scratch' or 'resume'
+init_from = 'resume' # 'scratch' or 'resume'
 dino_size = "base"  # small is ~21M, base ~86M, large ~300M, giant ~1.1B
 use_dino_registers = True
-load_checkpoint_name = "v3_base_12_64_swiglu_latest_10k.pt"
-save_checkpoint_name = "exp_2L128_reg_stride10.pt"
-metrics_name = "exp_2L128_reg_stride10.png"
+load_checkpoint_name = "exp_2L128_25k_smooth.pt"
+save_checkpoint_name = "exp_2L128_25k_smooth.pt"
+metrics_name = "exp_2L128_25k_smooth_full.png"
 gradient_accumulation_steps = 1 # used to simulate larger batch sizes
 batch_size = 256    # if gradient_accumulation_steps > 1, this is the micro-batch size
 train_split = 0.95   # test val split, keep same for resume
@@ -53,7 +53,7 @@ cls_option = "both"    # "cls_only", "both", or "patches_only"
 transformer_dim = 128
 num_layers = 2
 num_heads = 4
-label_smoothing = 0.0  # 0 to disable, 0.05 recommended
+label_smoothing = 0.05  # 0 to disable, 0.05 recommended
 shift_labels = True
 show_per_class_during_training = True
 
@@ -61,7 +61,7 @@ show_per_class_during_training = True
 learning_rate = 5e-5 # max learning rate    (when adding muon best learning area was around 2e-5)
 # Global Muon learning rate (used for param groups with use_muon=True)
 muon_learning_rate = 0.0015   # 0.02 is recommended by Muon
-max_iters = 6000 # total number of training iterations
+max_iters = 25000 # total number of training iterations
 # optimizer settings
 weight_decay = 0.075
 beta1 = 0.9
@@ -69,8 +69,8 @@ beta2 = 0.995
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
-warmup_iters = 500 # how many steps to warm up for
-lr_decay_iters = 5500 # should be ~= max_iters per Chinchilla
+warmup_iters = 200 # how many steps to warm up for
+lr_decay_iters = 24000 # should be ~= max_iters per Chinchilla
 min_lr = 3e-6 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
