@@ -1,0 +1,297 @@
+import argparse
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+DEFAULT_FEATURE_DIR = "temp/precomputed_full_10x"
+
+BASE_ARGS = [
+    "--batch_size",
+    "256",
+    "--eval_interval",
+    "500",
+    "--eval_iters",
+    "12",
+    "--learning_rate",
+    "5e-5",
+    "--muon_lr",
+    "0.0015",
+    "--warmup_iters",
+    "100",
+    "--num_workers",
+    "4",
+    "--prefetch_factor",
+    "2",
+    "--shuffle_chunk_size",
+    "4096",
+    "--seed",
+    "1337",
+]
+
+EXPERIMENTS = [
+    {
+        "id": 1,
+        "name": "1_baseline_128d",
+        "desc": "Baseline hidden size 128 (no projection)",
+        "args": [
+            "--out_dir",
+            "models/feature_head/exp_1_baseline_128d",
+            "--save_name",
+            "baseline_128d.pt",
+            "--metrics_name",
+            "baseline_128d.png",
+            "--num_layers",
+            "2",
+            "--num_heads",
+            "4",
+            "--dropout",
+            "0.1",
+            "--weight_decay",
+            "0.075",
+            "--max_iters",
+            "5000",
+            "--lr_decay_iters",
+            "5000",
+        ],
+    },
+    {
+        "id": 2,
+        "name": "2_proj_96d",
+        "desc": "Downproject 128->96 for faster iterations",
+        "args": [
+            "--out_dir",
+            "models/feature_head/exp_2_proj_96d",
+            "--save_name",
+            "proj_96d.pt",
+            "--metrics_name",
+            "proj_96d.png",
+            "--model_dim",
+            "96",
+            "--num_layers",
+            "2",
+            "--num_heads",
+            "4",
+            "--dropout",
+            "0.1",
+            "--weight_decay",
+            "0.075",
+            "--max_iters",
+            "5000",
+            "--lr_decay_iters",
+            "5000",
+        ],
+    },
+    {
+        "id": 3,
+        "name": "3_proj_64d",
+        "desc": "Aggressive speed profile with 128->64 projection",
+        "args": [
+            "--out_dir",
+            "models/feature_head/exp_3_proj_64d",
+            "--save_name",
+            "proj_64d.pt",
+            "--metrics_name",
+            "proj_64d.png",
+            "--model_dim",
+            "64",
+            "--num_layers",
+            "2",
+            "--num_heads",
+            "4",
+            "--dropout",
+            "0.0",
+            "--weight_decay",
+            "0.05",
+            "--max_iters",
+            "5000",
+            "--lr_decay_iters",
+            "5000",
+        ],
+    },
+    {
+        "id": 46,
+        "name": "46_baseline_15k",
+        "desc": "Baseline 15K: dim64, 6 layers, dropout 0.35",
+        "args": [
+            "--out_dir",
+            "models/feature_head/exp_46_baseline_15k",
+            "--save_name",
+            "baseline_15k.pt",
+            "--metrics_name",
+            "baseline_15k.png",
+            "--model_dim",
+            "64",
+            "--num_layers",
+            "6",
+            "--dropout",
+            "0.35",
+            "--max_iters",
+            "15000",
+            "--lr_decay_iters",
+            "15000",
+        ],
+    },
+    {
+        "id": 47,
+        "name": "47_cosine_warm_restarts",
+        "desc": "15K baseline with 3-cycle cosine warm restarts",
+        "args": [
+            "--out_dir",
+            "models/feature_head/exp_47_cosine_warm_restarts",
+            "--save_name",
+            "cosine_warm_restarts.pt",
+            "--metrics_name",
+            "cosine_warm_restarts.png",
+            "--model_dim",
+            "64",
+            "--num_layers",
+            "6",
+            "--dropout",
+            "0.35",
+            "--max_iters",
+            "15000",
+            "--lr_decay_iters",
+            "15000",
+            "--lr_restart_cycles",
+            "3",
+        ],
+    },
+    {
+        "id": 48,
+        "name": "48_batch512_scaled_lr",
+        "desc": "15K baseline with 2x batch and scaled learning rates",
+        "args": [
+            "--out_dir",
+            "models/feature_head/exp_48_batch512_scaled_lr",
+            "--save_name",
+            "batch512_scaled_lr.pt",
+            "--metrics_name",
+            "batch512_scaled_lr.png",
+            "--model_dim",
+            "64",
+            "--num_layers",
+            "6",
+            "--dropout",
+            "0.35",
+            "--max_iters",
+            "15000",
+            "--lr_decay_iters",
+            "15000",
+            "--batch_size",
+            "512",
+            "--learning_rate",
+            "1e-4",
+            "--muon_lr",
+            "0.003",
+        ],
+    },
+]
+
+
+def _build_experiment_index():
+    ordered = []
+    by_id = {}
+    for idx, exp in enumerate(EXPERIMENTS, start=1):
+        exp_id = int(exp.get("id", idx))
+        if exp_id in by_id:
+            raise ValueError(f"Duplicate experiment id: {exp_id}")
+        ordered.append((idx, exp_id, exp))
+        by_id[exp_id] = exp
+    return ordered, by_id
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Run feature head experiments")
+    parser.add_argument("--start_from", type=int, default=1, help="1-based index of first experiment to run")
+    parser.add_argument("--experiments", type=int, nargs="+", default=None, help="experiment ids to run")
+    parser.add_argument("--feature_dir", type=str, default=DEFAULT_FEATURE_DIR)
+    parser.add_argument("--timeout_sec", type=int, default=7200)
+    args = parser.parse_args(argv)
+
+    ordered, by_id = _build_experiment_index()
+
+    if args.experiments is not None:
+        invalid_ids = sorted(set(args.experiments) - set(by_id))
+        if invalid_ids:
+            parser.error(f"Unknown experiment ids: {invalid_ids}")
+    elif args.start_from < 1 or args.start_from > len(ordered):
+        parser.error(f"--start_from must be between 1 and {len(ordered)}")
+    if args.timeout_sec <= 0:
+        parser.error("--timeout_sec must be positive")
+    return args
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    ordered, by_id = _build_experiment_index()
+
+    log_dir = Path("temp/experiment_logs")
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    results = []
+    total_start = time.time()
+
+    if args.experiments is not None:
+        selected_experiments = []
+        seen = set()
+        for exp_id in args.experiments:
+            if exp_id not in seen:
+                selected_experiments.append((exp_id, by_id[exp_id]))
+                seen.add(exp_id)
+        print(f"Running experiment ids: {[exp_id for exp_id, _ in selected_experiments]}")
+    else:
+        selected_experiments = [(exp_id, exp) for idx, exp_id, exp in ordered if idx >= args.start_from]
+
+    if args.experiments is None and args.start_from > 1:
+        print(f"Skipping first {args.start_from - 1} experiment(s)")
+
+    for exp_id, exp in selected_experiments:
+        name = exp["name"]
+        desc = exp["desc"]
+        exp_args = ["--feature_dir", args.feature_dir] + BASE_ARGS + exp["args"]
+
+        print(f"\n{'=' * 80}")
+        print(f"EXPERIMENT: {name} (id={exp_id})")
+        print(f"Description: {desc}")
+        print(f"{'=' * 80}")
+
+        log_path = log_dir / f"{name}.log"
+        cmd = ["uv", "run", "python", "-u", "feature_training.py"] + exp_args
+        print(f"Command: {' '.join(cmd)}")
+
+        start = time.time()
+        try:
+            with open(log_path, "w", encoding="utf-8") as log_file:
+                result = subprocess.run(
+                    cmd,
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    timeout=args.timeout_sec,
+                )
+            elapsed = time.time() - start
+            status = "OK" if result.returncode == 0 else f"FAILED (code {result.returncode})"
+            print(f"  Status: {status} | Time: {elapsed / 60:.1f}min | Log: {log_path}")
+            results.append((name, status, elapsed))
+        except subprocess.TimeoutExpired:
+            elapsed = time.time() - start
+            print(f"  Status: TIMEOUT | Time: {elapsed / 60:.1f}min | Log: {log_path}")
+            results.append((name, "TIMEOUT", elapsed))
+        except Exception as err:
+            elapsed = time.time() - start
+            print(f"  Status: ERROR: {err} | Time: {elapsed / 60:.1f}min")
+            results.append((name, f"ERROR: {err}", elapsed))
+
+    total_elapsed = time.time() - total_start
+    print(f"\n\n{'=' * 80}")
+    print(f"ALL EXPERIMENTS COMPLETE ({total_elapsed / 60:.1f}min total)")
+    print(f"{'=' * 80}")
+    print(f"{'Name':<30} {'Status':<20} {'Time':>10}")
+    print(f"{'-' * 65}")
+    for name, status, elapsed in results:
+        print(f"{name:<30} {status:<20} {elapsed / 60:>8.1f}min")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
