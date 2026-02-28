@@ -10,3 +10,4 @@ __pycache__/
 training_new_h100.py
 .venv/
 dinov3/
+temp/
