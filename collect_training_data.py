@@ -6,7 +6,6 @@ import time
 import os
 import pandas as pd
 from grabkeys import key_check
-from training_new import generate_timeseries
 import h5py
 from threading import Thread as Worker
 import config
@@ -14,7 +13,7 @@ import utils
 
 curr_file_index = 0
 gb_per_file = 2
-current_data_dir = config.turns_data_dir_name
+current_data_dir = config.stuck_data_dir_name
 
 
 def convert_output(key):
@@ -238,10 +237,84 @@ def test_collection_correct():
     print(labels)
 
 
+def play_data(filepath, print_labels=True, fps=40):
+    """
+    Simple function to load and play back recorded data as a video.
+    
+    Args:
+        filepath: Path to the .h5 file to load
+        print_labels: Whether to print the label for each frame
+        fps: Frames per second for playback (controls speed)
+    """
+    # Load the data
+    images, labels = utils.load_file(filepath)
+    print(f"Loaded {images.shape[0]} frames from {filepath}")
+    
+    # Calculate target time per frame in seconds
+    target_frame_time = 1.0 / fps
+    
+    # FPS tracking variables
+    start_time = time.time()
+    frame_count = 0
+    last_fps_print = time.time()
+    next_frame_time = start_time
+    
+    # Play through each frame
+    for i in range(len(images)):
+        frame_start = time.time()
+        
+        img = images[i]
+        label = labels[i]
+        
+        # Convert label to readable format
+        label_idx = np.argmax(label)
+        label_name = None
+        for key, value in config.outputs.items():
+            if value == label_idx:
+                label_name = key
+                break
+        
+        if print_labels:
+            print(f"Frame {i}: {label_name}")
+        
+        # Convert from RGB to BGR for cv2
+        img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        
+        # Display the frame
+        cv2.imshow("Data Playback", img_bgr)
+        
+        # Track FPS
+        frame_count += 1
+        if time.time() - last_fps_print >= 1.0:
+            actual_fps = frame_count / (time.time() - start_time)
+            print(f"Actual FPS: {actual_fps:.2f} (Target: {fps})")
+            last_fps_print = time.time()
+        
+        # Calculate next frame time
+        next_frame_time += target_frame_time
+        
+        # Always call waitKey(1) to update window (this is required for cv2.imshow)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+        
+        # Wait until it's time for the next frame with precise timing
+        time_until_next = next_frame_time - time.time()
+        if time_until_next > 0:
+            time.sleep(time_until_next)
+    
+    # Print final FPS stats
+    total_time = time.time() - start_time
+    avg_fps = frame_count / total_time if total_time > 0 else 0
+    print(f"\nPlayback finished: {frame_count} frames in {total_time:.2f}s")
+    print(f"Average actual FPS: {avg_fps:.2f} (Target: {fps})")
+    cv2.destroyAllWindows()
+
+
 if __name__ == "__main__":
     # load_data()
     # normalize()
     # main(False, no_pause_remove=True)
     # test_collection_correct()
-    show_training_data_sequenced()
+    # show_training_data_sequenced()
+    play_data(current_data_dir + "\\240x180_rgb_33.h5", print_labels=True, fps=80)
 

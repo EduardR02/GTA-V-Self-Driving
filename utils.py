@@ -141,7 +141,7 @@ def convert_labels_to_binary(labels):
     return new_labels
 
 
-def divide_dataset_lstm_compatible(filenames, test_data_size, allowed_ram=config.allowed_ram_mb, incorporate_fps=True):
+def divide_dataset_lstm_compatible(filenames, test_data_size, allowed_ram=32, incorporate_fps=True):
     """
     Don't really care about exceeding allowed ram by one file because filesizes are so small
     Needs to be rewritten if that stops to be the case
