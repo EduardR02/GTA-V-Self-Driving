@@ -1,5 +1,6 @@
 import argparse
 import bisect
+from collections import deque
 import json
 import math
 import os
@@ -9,13 +10,16 @@ import time
 from contextlib import nullcontext
 from pathlib import Path
 
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 from tqdm import tqdm
 
+from fp8_utils import add_fp8_cli_args, maybe_enable_fp8
 from model import EfficientTransformer, EfficientTransformerBlock
 from muon import SingleDeviceMuonWithAuxAdam
 
@@ -23,6 +27,145 @@ from muon import SingleDeviceMuonWithAuxAdam
 UNWANTED_PREFIX = "_orig_mod."
 VALID_WARP_LABEL = np.array([1, 0, 0, 0], dtype=np.float32)
 ZERO_LABEL = np.array([0, 0, 0, 0], dtype=np.float32)
+FINAL_POS_WEIGHT = torch.tensor([1.0, 11.285, 25.556 / 2, 11.392], dtype=torch.float32)
+
+
+def get_effective_pos_weight(
+    base_pos_weight: torch.Tensor | None = None,
+    *,
+    a_pos_weight_scale: float = 1.0,
+    s_pos_weight_scale: float = 1.0,
+    d_pos_weight_scale: float = 1.0,
+) -> torch.Tensor:
+    base = FINAL_POS_WEIGHT if base_pos_weight is None else base_pos_weight
+    scaled = base.clone().to(dtype=torch.float32)
+    scaled[1] *= float(a_pos_weight_scale)
+    scaled[2] *= float(s_pos_weight_scale)
+    scaled[3] *= float(d_pos_weight_scale)
+    return scaled
+
+
+def _sample_mixed_versions(num_versions: int, batch_size: int) -> np.ndarray:
+    if batch_size <= 0:
+        return np.empty((0,), dtype=np.int64)
+    if num_versions <= 1:
+        return np.zeros((batch_size,), dtype=np.int64)
+
+    versions = np.random.randint(0, num_versions, size=batch_size, dtype=np.int64)
+    if batch_size > 1 and np.all(versions == versions[0]):
+        replace_pos = int(np.random.randint(0, batch_size))
+        replacement = int(np.random.randint(0, num_versions - 1))
+        if replacement >= versions[0]:
+            replacement += 1
+        versions[replace_pos] = replacement
+    return versions
+
+
+class ChunkedRandomSampler(Sampler[int]):
+    def __init__(self, data_source: Dataset, chunk_size: int, seed: int = 0):
+        self.data_source = data_source
+        self.chunk_size = max(int(chunk_size), 1)
+        self.seed = int(seed)
+        self._epoch = 0
+
+    def __len__(self) -> int:
+        return len(self.data_source)
+
+    def __iter__(self):
+        n = len(self.data_source)
+        if n <= 0:
+            return iter(())
+
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + self._epoch)
+        self._epoch += 1
+
+        perm = torch.randperm(n, generator=generator)
+        num_chunks = (n + self.chunk_size - 1) // self.chunk_size
+        if num_chunks <= 1:
+            return iter(perm.tolist())
+
+        chunk_order = torch.randperm(num_chunks, generator=generator).tolist()
+
+        def _yield_indices():
+            for chunk_idx in chunk_order:
+                start = chunk_idx * self.chunk_size
+                end = min(start + self.chunk_size, n)
+                for item in perm[start:end].tolist():
+                    yield int(item)
+
+        return _yield_indices()
+
+
+class AsyncBatchPrefetcher:
+    def __init__(self, loader, device: torch.device, prefetch_batches: int = 3, **_ignored):
+        self.loader = loader
+        self.device = torch.device(device)
+        self.prefetch_batches = max(int(prefetch_batches), 1)
+
+    def __len__(self):
+        return len(self.loader)
+
+    @staticmethod
+    def _to_device(batch, device: torch.device):
+        if torch.is_tensor(batch):
+            if batch.device == device:
+                return batch
+            return batch.to(device, non_blocking=True)
+        if isinstance(batch, tuple):
+            return tuple(AsyncBatchPrefetcher._to_device(v, device) for v in batch)
+        if isinstance(batch, list):
+            return [AsyncBatchPrefetcher._to_device(v, device) for v in batch]
+        if isinstance(batch, dict):
+            return {k: AsyncBatchPrefetcher._to_device(v, device) for k, v in batch.items()}
+        return batch
+
+    @staticmethod
+    def _record_stream(batch, stream):
+        if torch.is_tensor(batch):
+            batch.record_stream(stream)
+            return
+        if isinstance(batch, tuple) or isinstance(batch, list):
+            for item in batch:
+                AsyncBatchPrefetcher._record_stream(item, stream)
+            return
+        if isinstance(batch, dict):
+            for item in batch.values():
+                AsyncBatchPrefetcher._record_stream(item, stream)
+
+    def __iter__(self):
+        if self.device.type != "cuda":
+            yield from self.loader
+            return
+
+        data_iter = iter(self.loader)
+        stream = torch.cuda.Stream(device=self.device)
+        queue = deque()
+
+        def _prefetch_one() -> bool:
+            try:
+                batch = next(data_iter)
+            except StopIteration:
+                return False
+            with torch.cuda.stream(stream):
+                moved = self._to_device(batch, self.device)
+            queue.append(moved)
+            return True
+
+        for _ in range(self.prefetch_batches):
+            if not _prefetch_one():
+                break
+
+        while queue:
+            current_stream = torch.cuda.current_stream(device=self.device)
+            current_stream.wait_stream(stream)
+            batch = queue.popleft()
+            self._record_stream(batch, current_stream)
+            yield batch
+            _prefetch_one()
+
+
+AsyncPrefetcher = AsyncBatchPrefetcher
 
 
 def _parse_bool(value):
@@ -99,11 +242,16 @@ class PrecomputedFeatureDataset(Dataset):
         labels_path = self.feature_dir / "labels.npy"
         if not labels_path.exists():
             raise FileNotFoundError(f"labels.npy not found: {labels_path}")
-        labels = np.load(labels_path, mmap_mode="r")
-        if labels.shape[0] != self.num_images:
-            raise RuntimeError(f"labels shape mismatch: {labels.shape[0]} != metadata.num_images={self.num_images}")
+        labels_probe = np.load(labels_path, mmap_mode="r")
+        labels_shape = tuple(int(dim) for dim in labels_probe.shape)
+        if labels_shape[0] != self.num_images:
+            raise RuntimeError(f"labels shape mismatch: {labels_shape[0]} != metadata.num_images={self.num_images}")
+        handle = getattr(labels_probe, "_mmap", None)
+        if handle is not None:
+            handle.close()
 
         self.labels_path = labels_path
+        self.labels_shape = labels_shape
         self.labels = None
         self.features = None
 
@@ -162,7 +310,7 @@ class PrecomputedFeatureDataset(Dataset):
         effective_sequence_length = (self.sequence_len - 1) * self.sequence_stride + self.label_shift
         for file_idx, file_len in enumerate(self.file_lengths):
             file_samples = file_len - effective_sequence_length
-            file_path = self.file_paths[file_idx]
+            file_path = str(self.file_paths[file_idx])
             if "stuck" in file_path:
                 stuck_start = int(self.stuck_offsets[file_idx])
                 file_samples -= max(stuck_start - effective_sequence_length, 0)
@@ -189,9 +337,10 @@ class PrecomputedFeatureDataset(Dataset):
     def _global_offset(self, file_idx: int) -> int:
         return self.file_boundaries[file_idx - 1] if file_idx > 0 else 0
 
-    def __getitem__(self, idx):
-        features_memmaps, labels_memmap = self._ensure_memmaps()
-
+    def _resolve_frame_indices(self, idx: int) -> tuple[np.ndarray, np.ndarray]:
+        idx = int(idx)
+        if idx < 0 or idx >= len(self):
+            raise IndexError(f"Index out of range: {idx}")
         if not self.is_train:
             idx += self._get_split_idx()
 
@@ -201,42 +350,103 @@ class PrecomputedFeatureDataset(Dataset):
         local_idx = idx - prev
 
         sequence_range = (self.sequence_len - 1) * self.sequence_stride
-        file_path = self.file_paths[file_idx]
+        file_path = str(self.file_paths[file_idx])
         if "stuck" in file_path:
             start_k = int(self.stuck_offsets[file_idx])
             local_idx += max(start_k - sequence_range - self.label_shift, 0)
 
-        version_idx = random.randrange(self.num_versions) if self.is_train else 0
-        version_meta = self.version_info[version_idx]
-
-        img_indices_local = [local_idx + i * self.sequence_stride for i in range(self.sequence_len)]
-        label_indices_local = [
+        img_indices_local = np.array([local_idx + i * self.sequence_stride for i in range(self.sequence_len)], dtype=np.int64)
+        label_indices_local = np.array(
+            [
             local_idx + self.label_shift + i * self.sequence_stride for i in range(self.sequence_len)
-        ]
+            ],
+            dtype=np.int64,
+        )
         offset = self._global_offset(file_idx)
-        img_indices = [offset + i for i in img_indices_local]
-        label_indices = [offset + i for i in label_indices_local]
+        return img_indices_local + offset, label_indices_local + offset
 
-        labels = np.asarray(labels_memmap[label_indices], dtype=np.float32).copy()
-        features = features_memmaps[version_idx][img_indices]
+    def __getitem__(self, idx):
+        return self.__getitems__([idx])[0]
 
-        aug_type = version_meta["type"]
-        if aug_type == "flipped":
-            labels[:, [1, 3]] = labels[:, [3, 1]]
-        elif aug_type == "warped":
-            last_label = labels[-1]
-            qualifies = np.array_equal(last_label, VALID_WARP_LABEL) or np.array_equal(last_label, ZERO_LABEL)
-            if not qualifies:
-                features = features_memmaps[0][img_indices]
-            else:
-                direction = version_meta.get("warp_direction", "left")
-                if direction == "left":
-                    labels[-1, 1] = 1.0
-                else:
-                    labels[-1, 3] = 1.0
+    def __getitems__(self, indices):
+        if len(indices) == 0:
+            return []
 
-        flat = np.asarray(features, dtype=np.float16).reshape(self.sequence_len * self.num_tokens, self.embed_dim)
-        return torch.from_numpy(flat), torch.from_numpy(labels.astype(np.float32, copy=False))
+        features_memmaps, labels_memmap = self._ensure_memmaps()
+        batch_size = len(indices)
+
+        if self.is_train:
+            version_indices = _sample_mixed_versions(self.num_versions, batch_size)
+        else:
+            version_indices = np.zeros((batch_size,), dtype=np.int64)
+
+        records = []
+        for out_idx, idx in enumerate(indices):
+            img_indices, label_indices = self._resolve_frame_indices(int(idx))
+            records.append(
+                {
+                    "out_idx": out_idx,
+                    "img_indices": img_indices,
+                    "label_indices": label_indices,
+                    "version_idx": int(version_indices[out_idx]),
+                }
+            )
+
+        grouped: dict[int, list[dict]] = {}
+        for rec in records:
+            grouped.setdefault(rec["version_idx"], []).append(rec)
+
+        out = [None] * batch_size
+
+        for version_idx, grouped_records in grouped.items():
+            all_img_indices = np.concatenate([rec["img_indices"] for rec in grouped_records])
+            img_order = np.argsort(all_img_indices, kind="stable")
+            sorted_img = all_img_indices[img_order]
+            sorted_features = np.asarray(features_memmaps[version_idx][sorted_img], dtype=np.float16)
+            inv_img_order = np.empty_like(img_order)
+            inv_img_order[img_order] = np.arange(img_order.size)
+            grouped_features = sorted_features[inv_img_order].reshape(
+                len(grouped_records),
+                self.sequence_len,
+                self.num_tokens,
+                self.embed_dim,
+            )
+
+            all_label_indices = np.concatenate([rec["label_indices"] for rec in grouped_records])
+            label_order = np.argsort(all_label_indices, kind="stable")
+            sorted_labels = np.asarray(labels_memmap[all_label_indices[label_order]], dtype=np.float32)
+            inv_label_order = np.empty_like(label_order)
+            inv_label_order[label_order] = np.arange(label_order.size)
+            grouped_labels = sorted_labels[inv_label_order].reshape(len(grouped_records), self.sequence_len, -1)
+
+            version_meta = self.version_info[version_idx]
+            aug_type = version_meta.get("type", "unaltered")
+
+            for local_pos, rec in enumerate(grouped_records):
+                labels = grouped_labels[local_pos].copy()
+                features = grouped_features[local_pos]
+
+                if aug_type == "flipped":
+                    labels[:, [1, 3]] = labels[:, [3, 1]]
+                elif aug_type == "warped":
+                    last_label = labels[-1]
+                    qualifies = np.array_equal(last_label, VALID_WARP_LABEL) or np.array_equal(last_label, ZERO_LABEL)
+                    if not qualifies:
+                        features = np.asarray(features_memmaps[0][rec["img_indices"]], dtype=np.float16)
+                    else:
+                        direction = version_meta.get("warp_direction", "left")
+                        if direction == "left":
+                            labels[-1, 1] = 1.0
+                        else:
+                            labels[-1, 3] = 1.0
+
+                flat = np.asarray(features, dtype=np.float16).reshape(self.sequence_len * self.num_tokens, self.embed_dim)
+                out[rec["out_idx"]] = (
+                    torch.from_numpy(flat),
+                    torch.from_numpy(labels.astype(np.float32, copy=False)),
+                )
+
+        return out
 
 
 class HeadOnlyModel(nn.Module):
@@ -275,7 +485,7 @@ class HeadOnlyModel(nn.Module):
         )
         self.fc_head = nn.Linear(hidden_dim, num_classes)
         if pos_weights is None:
-            pos_weights = torch.tensor([1.0, 11.285, 25.556 / 2, 11.392], dtype=torch.float32)
+            pos_weights = FINAL_POS_WEIGHT.clone()
         self.loss_fct = nn.BCEWithLogitsLoss(pos_weight=pos_weights)
 
     def forward(self, features: torch.Tensor, labels: torch.Tensor | None = None):
@@ -335,6 +545,7 @@ class HeadOnlyModel(nn.Module):
         dropout: float,
         max_seq_len: int,
         model_dim: int | None = None,
+        pos_weights: torch.Tensor | None = None,
         label_smoothing: float = 0.0,
     ):
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
@@ -354,6 +565,7 @@ class HeadOnlyModel(nn.Module):
             num_layers=num_layers,
             dropout=dropout,
             max_seq_len=max_seq_len,
+            pos_weights=pos_weights,
             label_smoothing=label_smoothing,
         )
         msg = model.load_state_dict(keep, strict=False)
@@ -446,6 +658,14 @@ def _next_batch(loader, loader_iter):
             return None, loader_iter
 
 
+def _move_to_device_if_needed(tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
+    if tensor.device == device:
+        return tensor
+    if device.type == "cuda" and tensor.device.type == "cpu":
+        return tensor.pin_memory().to(device, non_blocking=True)
+    return tensor.to(device)
+
+
 @torch.no_grad()
 def estimate_loss(model, train_loader, val_loader, args, ctx, device):
     model.eval()
@@ -473,12 +693,8 @@ def estimate_loss(model, train_loader, val_loader, args, ctx, device):
                 break
 
             x, y = batch
-            if device.type == "cuda":
-                x = x.pin_memory().to(device, non_blocking=True)
-                y_dev = y.pin_memory().to(device, non_blocking=True)
-            else:
-                x = x.to(device)
-                y_dev = y.to(device)
+            x = _move_to_device_if_needed(x, device)
+            y_dev = _move_to_device_if_needed(y, device)
 
             with ctx:
                 logits, loss = model(x, labels=y_dev)
@@ -613,6 +829,9 @@ def create_arg_parser():
     parser.add_argument("--beta1", type=float, default=0.9)
     parser.add_argument("--beta2", type=float, default=0.995)
     parser.add_argument("--grad_clip", type=float, default=1.0)
+    parser.add_argument("--a_pos_weight_scale", type=float, default=1.0)
+    parser.add_argument("--s_pos_weight_scale", type=float, default=1.0)
+    parser.add_argument("--d_pos_weight_scale", type=float, default=1.0)
 
     parser.add_argument("--sequence_len", type=int, default=None)
     parser.add_argument("--sequence_stride", type=int, default=None)
@@ -621,6 +840,7 @@ def create_arg_parser():
 
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--prefetch_factor", type=int, default=2)
+    parser.add_argument("--async_prefetch_batches", type=int, default=3)
     parser.add_argument("--shuffle_chunk_size", type=int, default=4096)
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -630,6 +850,7 @@ def create_arg_parser():
     parser.add_argument("--resume_optimizer", action="store_true", default=True)
     parser.add_argument("--no_resume_optimizer", action="store_false", dest="resume_optimizer")
     parser.add_argument("--always_save_checkpoint", action="store_true", default=True)
+    add_fp8_cli_args(parser, default_mode="auto")
     return parser
 
 
@@ -670,6 +891,7 @@ def main():
     num_tokens = int(metadata["num_tokens"])
     flat_tokens = args.sequence_len * num_tokens
     max_seq_len = flat_tokens + 1
+    device = torch.device(args.device)
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -700,9 +922,15 @@ def main():
     if args.num_workers > 0:
         loader_kwargs["prefetch_factor"] = args.prefetch_factor
 
-    train_loader = DataLoader(
+    train_sampler = ChunkedRandomSampler(
         train_dataset,
-        shuffle=True,
+        chunk_size=args.shuffle_chunk_size,
+        seed=args.seed,
+    )
+
+    base_train_loader = DataLoader(
+        train_dataset,
+        sampler=train_sampler,
         drop_last=True,
         **loader_kwargs,
     )
@@ -713,11 +941,24 @@ def main():
         **loader_kwargs,
     )
 
+    train_loader = AsyncBatchPrefetcher(
+        base_train_loader,
+        device=device,
+        prefetch_batches=args.async_prefetch_batches,
+    )
+
     if len(train_loader) == 0:
         raise RuntimeError(
             "Train DataLoader has zero batches. Reduce --batch_size, lower --train_split, "
             "or change training loader drop_last behavior."
         )
+
+    pos_weights = get_effective_pos_weight(
+        FINAL_POS_WEIGHT,
+        a_pos_weight_scale=args.a_pos_weight_scale,
+        s_pos_weight_scale=args.s_pos_weight_scale,
+        d_pos_weight_scale=args.d_pos_weight_scale,
+    )
 
     if args.checkpoint_path:
         model = HeadOnlyModel.from_checkpoint(
@@ -729,6 +970,7 @@ def main():
             num_layers=args.num_layers,
             dropout=args.dropout,
             max_seq_len=max_seq_len,
+            pos_weights=pos_weights,
             label_smoothing=args.label_smoothing,
         )
     else:
@@ -740,11 +982,18 @@ def main():
             num_layers=args.num_layers,
             dropout=args.dropout,
             max_seq_len=max_seq_len,
+            pos_weights=pos_weights,
             label_smoothing=args.label_smoothing,
         )
 
-    device = torch.device(args.device)
     model = model.to(device)
+
+    model, fp8_state = maybe_enable_fp8(
+        model,
+        mode=args.fp8,
+        use_dinov3=True,
+        device=device,
+    )
 
     optimizer = model.configure_optimizers(
         weight_decay=args.weight_decay,
@@ -780,10 +1029,25 @@ def main():
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda" and args.dtype == "float16"))
 
     print(f"Train samples: {len(train_dataset)} | Val samples: {len(val_dataset)}")
-    print(
-        f"flat_tokens={flat_tokens}, embed_dim={args.embed_dim}, device={device}, "
-        f"dtype={args.dtype}, label_smoothing={args.label_smoothing}"
+    fp8_status = "enabled" if fp8_state.enabled else f"disabled ({fp8_state.reason})"
+    if fp8_state.enabled and fp8_state.recipe is not None:
+        fp8_status = f"enabled:{fp8_state.recipe}"
+
+    config_parts = [
+        f"flat_tokens={flat_tokens}",
+        f"embed_dim={args.embed_dim}",
+    ]
+    if args.model_dim is not None:
+        config_parts.append(f"model_dim={args.model_dim}")
+    config_parts.extend(
+        [
+            f"device={device}",
+            f"dtype={args.dtype}",
+            f"fp8={fp8_status}",
+            f"label_smoothing={args.label_smoothing}",
+        ]
     )
+    print(", ".join(config_parts))
 
     metrics = {
         "iters": [],
@@ -833,12 +1097,8 @@ def main():
                 )
 
             x, y = batch
-            if device.type == "cuda":
-                x = x.pin_memory().to(device, non_blocking=True)
-                y_dev = y.pin_memory().to(device, non_blocking=True)
-            else:
-                x = x.to(device)
-                y_dev = y.to(device)
+            x = _move_to_device_if_needed(x, device)
+            y_dev = _move_to_device_if_needed(y, device)
 
             with ctx:
                 logits, loss = model(x, labels=y_dev)
