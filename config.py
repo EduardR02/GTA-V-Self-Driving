@@ -3,9 +3,9 @@ import os
 width = 240
 height = 180
 sequence_len = 3
-sequence_stride = 20     # Period between successive output sequences
+sequence_stride = 10     # Period between successive output sequences
 fps_at_recording_time = 80      # check by using main with fps only set to true, while having the game running
-fps_at_test_time = 34    # check by running model in main, while game is running!
+fps_at_test_time = 39    # check by running model in main, while game is running!
 use_dinov3 = True
 monitor = {'top': 27, 'left': 0, 'width': 800, 'height': 600}
 outputs = {"w": 0, "a": 1, "s": 2, "d": 3, "wa": 4, "wd": 5, "nothing": 6}
