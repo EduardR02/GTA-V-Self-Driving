@@ -51,8 +51,8 @@ def proportional_output_key(prediction, t_since_last_press):
     """
     press_keys = True
     log_presses = True
-    min_val_steer = 0.1  # 0 - 1 (0.01 - 0.05 seems best)       0.05 seems to be best for the best models, use 0.01 for more overfit models trained for very long with high batch size (512+) to cut out noise
-    speed_threshold = 0.2  # 0 - 1
+    min_val_steer = 0.45  # 0 - 1 (0.01 - 0.05 seems best)       0.05 seems to be best for the best models, use 0.01 for more overfit models trained for very long with high batch size (512+) to cut out noise
+    speed_threshold = 0.25  # 0 - 1
     prediction = prediction.float().numpy().squeeze()   # float in case bf16 selected
     # do this before thresholding to get the true values
     prediction = handle_opposite_keys(prediction, output_dict)
@@ -62,7 +62,7 @@ def proportional_output_key(prediction, t_since_last_press):
     w_idx, s_idx = output_dict['w'], output_dict['s']
     w_val, s_val = prediction[w_idx], prediction[s_idx]
     press_durations[w_idx] = (w_val >= speed_threshold) * (w_val >= s_val)
-    press_durations[s_idx] = (s_val >= 0.5) * (s_val > w_val)
+    press_durations[s_idx] = (s_val >= 0.4) * (s_val > w_val)
     # if prediction[output_dict['s']] < 0.5: press_durations[output_dict['s']] = 0
     # don't care about speed key values because we just want to press or not press
     press_durations *= t_since_last_press
@@ -97,6 +97,50 @@ def handle_opposite_keys(prediction, output_dict):
     return prediction
 
 
+# Simple controller: pick max of (A,D) and (W,S), thresholded; A/D proportional duration, W/S full
+def simple_output_key(prediction, t_since_last_press):
+    p = prediction.float().numpy().squeeze()
+    w, a, s, d = output_dict['w'], output_dict['a'], output_dict['s'], output_dict['d']
+    steer_threshold = 0.45
+    speed_threshold = 0.4
+
+    # 1) Calculate press durations (gated max logic)
+    press_durations = np.zeros_like(p, dtype=float)
+
+    # Steering (A/D): pick max, press proportionally if above threshold
+    if p[a] >= p[d]:
+        chosen_idx, chosen_val = a, p[a]
+    else:
+        chosen_idx, chosen_val = d, p[d]
+    if chosen_val >= steer_threshold:
+        press_durations[chosen_idx] = float(min(t_since_last_press * max_steer, chosen_val * t_since_last_press))
+
+    # Speed (W/S): pick max, binary press if above threshold
+    if p[w] >= p[s]:
+        speed_idx, speed_val = w, p[w]
+    else:
+        speed_idx, speed_val = s, p[s]
+    if speed_val >= speed_threshold:
+        press_durations[speed_idx] = 1.0
+
+    # 2) Loop and press/release according to durations
+    for key, duration in zip([W, A, S, D], press_durations):
+        if duration > 0:
+            if key in [A, D]:
+                worker = Worker(target=press_and_release, args=(key, float(duration)))
+            else:
+                worker = Worker(target=PressKey, args=(key,))
+        else:
+            worker = Worker(target=ReleaseKey, args=(key,))
+        worker.start()
+
+    # 3) Print output in the same format as the other function
+    if np.sum(press_durations) == 0:
+        print("Nothing pressed, max val was:", p.max())
+    else:
+        pressed_keys = [key + "-" + str(p[value]) for key, value in output_dict.items() if press_durations[value] > 0]
+        print("Keys pressed:", ", ".join(pressed_keys))
+
 # noinspection PyTypeChecker
 def show_screen():
     sct = mss.mss()
@@ -115,7 +159,7 @@ def show_screen():
 
 
 @torch.no_grad()
-def main_with_cnn():
+def main_single():
     model = load_model(sample_only=True)
     sct = mss.mss()
     counter = 0
@@ -147,7 +191,7 @@ def main_with_cnn():
 
 
 @torch.no_grad()
-def main_with_lstm():
+def main_timeseries():
     model = load_model(sample_only=True)
     sct = mss.mss()
     t = time.time()
@@ -272,6 +316,6 @@ def get_screencap_img(sct):
 
 
 if __name__ == "__main__":
-    main_with_lstm()
-    # main_with_cnn()
+    main_timeseries()
+    # main_single()
     # show_screen()     # check alignment before running model
