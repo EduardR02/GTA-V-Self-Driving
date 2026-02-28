@@ -73,3 +73,16 @@
 - Failed interventions so far: focal loss, frame dropout, scheduled pos-weight, projection expansion to `256`, dropout `0.5`.
 - With `num_workers=4`, training is compute-bound.
 - Typical throughput for `64d/6L` + FP8 has been about `75-82 ms/iter`.
+
+### LR Schedule Discovery (exp46-61)
+- **S recall collapses with full cosine at 15K** — drops from ~50% at 5K to ~17% at 15K. Universal across all full-cosine runs.
+- **Fast cosine** (`lr_decay_iters` << `max_iters`) preserves S much better: LR decays to `min_lr` early, then model trains at low LR for the remaining iterations.
+- **Best S preservation**: short cosine (`lr_decay_iters=3000`) or fast cosine + `label_smoothing=0.01` — S stays ~50% throughout 15K with no collapse.
+- **Best val_acc**: fast cosine (`lr_decay_iters=5000`, `max_iters=15K-20K`) gives ~48-50% val_acc but S declines to ~33%.
+- **Pareto tradeoff**: higher val_acc ↔ lower S recall. Active cosine phase length controls where on this frontier.
+- Label smoothing alone (with full cosine) makes S collapse **worse**. LS only helps when combined with fast/short cosine.
+- Warm restarts (SGDR) did not prevent S collapse.
+- **Seed variance is massive**: S recall at 5K ranges 45-78% across seeds. Single-seed S comparisons with <15pt differences are noise.
+- **Eval fidelity matters**: `eval_iters=12` produced noisy S metrics. `eval_iters=50` gives much more stable readings.
+- Recommended proxy eval: always use `eval_iters ≥ 50`.
+
