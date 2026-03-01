@@ -323,28 +323,29 @@ class Dinov3ForTimeSeriesClassification(nn.Module):
                  use_transformers=False,
                  num_heads=4, num_layers=2, transformer_dim=32, label_smoothing=0.0, max_frames=3):
         super().__init__()
+
+        # Config / instance vars
         self.size = size
         self.num_classes = num_classes
-        self.expected_input_hw = (192, 240) # 16x16 size patches
+        self.expected_input_hw = (192, 240)  # 16x16 size patches
         self.max_frames = max_frames
         self.cls_option = cls_option
         self.label_smoothing = label_smoothing
-
-        # Aggregator params
         self.num_heads = num_heads
         self.num_layers = num_layers
-        self.use_dino_embed_size = False
         self.transformer_dim = transformer_dim
+        self.is_patches_only = (cls_option == "patches_only")
 
+        # Backbone loading
         if use_transformers:
             from transformers import AutoModel
-            
+
             size2hf = {
                 "base": "facebook/dinov3-vitb16-pretrain-lvd1689m",
-                "large": "facebook/dinov3-vitl16-pretrain-lvd1689m", 
+                "large": "facebook/dinov3-vitl16-pretrain-lvd1689m",
                 "huge": "facebook/dinov3-vith16-pretrain-lvd1689m",
             }
-            
+
             self.dinov3 = AutoModel.from_pretrained(
                 size2hf[self.size],
                 device_map="auto",
@@ -353,13 +354,12 @@ class Dinov3ForTimeSeriesClassification(nn.Module):
             )
             self.dinov3_embed_dim = self.dinov3.config.hidden_size
             self.num_register_tokens = self.dinov3.config.num_register_tokens
-            print(f"HF DINOv3 {size}: {self.dinov3_embed_dim}D, {self.num_register_tokens} register tokens")
-            
+
         else:
             size2hub = {
-                "base":  "dinov3_vitb16",
-                "large": "dinov3_vitl16", 
-                "huge":  "dinov3_vith16",
+                "base": "dinov3_vitb16",
+                "large": "dinov3_vitl16",
+                "huge": "dinov3_vith16",
             }
             # replace with your path to weights (also you will need to clone the dinov3 repo)
             weights_path = {
@@ -369,15 +369,47 @@ class Dinov3ForTimeSeriesClassification(nn.Module):
             }
             weights_path_full = os.path.join(repo_dir, "weights", weights_path[self.size])
             self.dinov3 = torch.hub.load(repo_dir, size2hub[self.size], source='local', weights=weights_path_full)
-            
-            self.dinov3 = self.dinov3.to(dtype) # immediately convert model (tiny bit faster than doing nothing and letting autocast handle it)
-            
+
+            self.dinov3 = self.dinov3.to(dtype)  # immediately convert model (tiny bit faster than doing nothing and letting autocast handle it)
+
             self.dinov3_embed_dim = self.dinov3.norm.weight.shape[0]
             self.num_register_tokens = getattr(self.dinov3, 'num_register_tokens', 0)
 
-        # Bind specialized token extraction and forward methods based on configuration
-        self.is_patches_only = (cls_option == "patches_only")
-        
+        # Derived dimensions
+        patch_size = 16
+        self.patches_per_frame = (self.expected_input_hw[0] // patch_size) * (self.expected_input_hw[1] // patch_size)
+
+        if self.transformer_dim is None:
+            self.embed_dim = self.dinov3_embed_dim
+        else:
+            self.embed_dim = self.transformer_dim
+
+        # Module construction
+        self.projection = nn.Linear(self.dinov3_embed_dim, self.embed_dim) if self.dinov3_embed_dim != self.embed_dim else nn.Identity()
+        self.cls_token = nn.Parameter(torch.randn(1, 1, self.embed_dim))
+
+        # Set RoPE to support more frames for future extension without retraining
+        # Use FIXED maximum to ensure checkpoint compatibility when changing max_frames
+        MAX_FRAMES_SUPPORTED = 10  # Fixed value - same for all checkpoints regardless of training frames
+        rope_max_seq_len = 1 + self.patches_per_frame * MAX_FRAMES_SUPPORTED
+        if not self.is_patches_only:
+            rope_max_seq_len += MAX_FRAMES_SUPPORTED
+
+        self.transformer = EfficientTransformer(
+            hidden_size=self.embed_dim,
+            num_heads=self.num_heads,
+            num_layers=self.num_layers,
+            dropout=dropout_rate,
+            use_xformers=True,
+            max_seq_len=rope_max_seq_len
+        )
+
+        self.fc_head = nn.Linear(self.embed_dim, num_classes)
+
+        pos_weights = torch.tensor([1.0, 11.285, 25.556/2, 11.392])
+        self.loss_fct = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weights)
+
+        # Method binding
         if use_transformers:
             if self.is_patches_only:
                 self._token_extractor = self._extract_tokens_patches_only_transformers
@@ -393,44 +425,12 @@ class Dinov3ForTimeSeriesClassification(nn.Module):
                 self._token_extractor = self._extract_tokens_both_torch_hub
                 self._forward_processor = self._forward_both
 
-        # Patch count from input resolution and patch size (ViT-B/16)
-        patch_size = 16
-        self.patches_per_frame = (self.expected_input_hw[0] // patch_size) * (self.expected_input_hw[1] // patch_size)
-
+        # Logging
+        if use_transformers:
+            print(f"HF DINOv3 {size}: {self.dinov3_embed_dim}D, {self.num_register_tokens} register tokens")
         print(f"DINOv3 {size}: {self.dinov3_embed_dim}D, {self.patches_per_frame} patches/frame, cls_option={cls_option}")
         print(f"Training context: {self.max_frames} frames = ~{1 + self.patches_per_frame * self.max_frames + (self.max_frames if not self.is_patches_only else 0)} tokens")
-
-        pos_weights = torch.tensor([1.0, 11.285, 25.556/2, 11.392])
-        self.loss_fct = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weights)
-
-        # Set embedding dimensions
-        if self.use_dino_embed_size or self.transformer_dim is None:
-            self.embed_dim = self.dinov3_embed_dim
-        else:
-            self.embed_dim = self.transformer_dim
-        
-        self.projection = nn.Linear(self.dinov3_embed_dim, self.embed_dim) if self.dinov3_embed_dim != self.embed_dim else nn.Identity()
-        self.cls_token = nn.Parameter(torch.randn(1, 1, self.embed_dim))
-
-        # Set RoPE to support more frames for future extension without retraining
-        # Use FIXED maximum to ensure checkpoint compatibility when changing max_frames
-        MAX_FRAMES_SUPPORTED = 10  # Fixed value - same for all checkpoints regardless of training frames
-        rope_max_seq_len = 1 + self.patches_per_frame * MAX_FRAMES_SUPPORTED
-        if not self.is_patches_only:
-            rope_max_seq_len += MAX_FRAMES_SUPPORTED
-        
         print(f"RoPE supports up to {MAX_FRAMES_SUPPORTED} frames ({rope_max_seq_len} tokens) for future extension")
-
-        self.transformer = EfficientTransformer(
-            hidden_size=self.embed_dim,
-            num_heads=self.num_heads,
-            num_layers=self.num_layers,
-            dropout=dropout_rate,
-            use_xformers=True,
-            max_seq_len=rope_max_seq_len
-        )
-
-        self.fc_head = nn.Linear(self.embed_dim, num_classes)
 
     def _extract_tokens_patches_only_transformers(self, x):
         """Extract patch tokens only - HuggingFace Transformers version"""
