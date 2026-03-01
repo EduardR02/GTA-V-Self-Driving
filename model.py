@@ -22,8 +22,6 @@ except ImportError:
     FLASH_ATTN_AVAILABLE = False
 
 
-# pos_weights = torch.tensor([0.585, 11.285, 25.556, 11.392]) # calculated from data
-
 class EfficientTransformerBlock(nn.Module):
     def __init__(self, hidden_size, num_heads, dropout=0.0, use_xformers=True, max_seq_len=4096, cls_attention_only=False):
         super().__init__()
@@ -322,15 +320,13 @@ class Dinov2ForTimeSeriesClassification(nn.Module):
 class Dinov3ForTimeSeriesClassification(nn.Module):
     def __init__(self, size, num_classes, dropout_rate=0.0, 
                  repo_dir="dinov3", dtype=torch.bfloat16, cls_option="patches_only", 
-                 use_transformers=False, use_pos_weights=True,
+                 use_transformers=False,
                  num_heads=4, num_layers=2, transformer_dim=32, label_smoothing=0.0, max_frames=3):
         super().__init__()
         self.size = size
         self.num_classes = num_classes
         self.expected_input_hw = (192, 240) # 16x16 size patches
-        self.dropout_rate = dropout_rate
         self.max_frames = max_frames
-        self.use_transformers = use_transformers
         self.cls_option = cls_option
         self.label_smoothing = label_smoothing
 
@@ -382,7 +378,7 @@ class Dinov3ForTimeSeriesClassification(nn.Module):
         # Bind specialized token extraction and forward methods based on configuration
         self.is_patches_only = (cls_option == "patches_only")
         
-        if self.use_transformers:
+        if use_transformers:
             if self.is_patches_only:
                 self._token_extractor = self._extract_tokens_patches_only_transformers
                 self._forward_processor = self._forward_patches_only
@@ -397,17 +393,9 @@ class Dinov3ForTimeSeriesClassification(nn.Module):
                 self._token_extractor = self._extract_tokens_both_torch_hub
                 self._forward_processor = self._forward_both
 
-        # Compute patches per frame
-        with torch.no_grad():
-            device = next(self.dinov3.parameters()).device
-            dummy = torch.randn(1, 3, *self.expected_input_hw, device=device, dtype=dtype)
-            test_output = self._token_extractor(dummy)
-            
-            self.patches_per_frame = test_output.shape[1] if self.is_patches_only else test_output[0].shape[1]
-            
-            del dummy, test_output
-            if device.type == 'cuda':
-                torch.cuda.empty_cache()
+        # Patch count from input resolution and patch size (ViT-B/16)
+        patch_size = 16
+        self.patches_per_frame = (self.expected_input_hw[0] // patch_size) * (self.expected_input_hw[1] // patch_size)
 
         print(f"DINOv3 {size}: {self.dinov3_embed_dim}D, {self.patches_per_frame} patches/frame, cls_option={cls_option}")
         print(f"Training context: {self.max_frames} frames = ~{1 + self.patches_per_frame * self.max_frames + (self.max_frames if not self.is_patches_only else 0)} tokens")
@@ -424,11 +412,6 @@ class Dinov3ForTimeSeriesClassification(nn.Module):
         self.projection = nn.Linear(self.dinov3_embed_dim, self.embed_dim) if self.dinov3_embed_dim != self.embed_dim else nn.Identity()
         self.cls_token = nn.Parameter(torch.randn(1, 1, self.embed_dim))
 
-        # Calculate context length for current training config
-        context_length = 1 + self.patches_per_frame * self.max_frames
-        if not self.is_patches_only:
-            context_length += self.max_frames  # Add frame CLS tokens
-        
         # Set RoPE to support more frames for future extension without retraining
         # Use FIXED maximum to ensure checkpoint compatibility when changing max_frames
         MAX_FRAMES_SUPPORTED = 10  # Fixed value - same for all checkpoints regardless of training frames
