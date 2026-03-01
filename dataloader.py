@@ -15,11 +15,11 @@ import config
 ADE_MEAN = (0.485, 0.456, 0.406)
 ADE_STD = (0.229, 0.224, 0.225)
 if config.use_dinov3:
-    height = 192    # 16 * 12
-    width = 240     # 16 * 15
+    height = 192  # 16 * 12
+    width = 240  # 16 * 15
 else:
-    height = 182    # 14 * 13
-    width = 252     # 14 * 18
+    height = 182  # 14 * 13
+    width = 252  # 14 * 18
 minimap_mask = np.zeros((config.height, config.width), dtype=np.uint8)
 # Minimap coordinates, (before padding for patches)
 x1, y1 = 3, config.height - 36  # Top-left corner of minimap
@@ -38,7 +38,7 @@ class RandomSkyMask(A.ImageOnlyTransform):
     def __init__(self, height_limit=(0.3, 0.4), p=0.5):
         super().__init__(p=p)
         self.height_limit = height_limit
-        
+
     def apply(self, img, **params):
         h, w, _ = img.shape
         mask_height = int(h * random.uniform(*self.height_limit))
@@ -48,49 +48,105 @@ class RandomSkyMask(A.ImageOnlyTransform):
 
 
 class H5Dataset(Dataset):
-    def __init__(self, data_dirs, train_split, is_train, classifier_type, flip_prob, warp_prob, zoom_prob, shift_labels=True):
+    def __init__(
+        self,
+        data_dirs,
+        train_split,
+        is_train,
+        classifier_type,
+        flip_prob,
+        warp_prob,
+        zoom_prob,
+        shift_labels=True,
+    ):
         self.train_split = train_split
         self.is_train = is_train
         self.classifier_type = classifier_type
         self.flip_prob = flip_prob
         self.warp_prob = warp_prob
         self.zoom_prob = zoom_prob
-        self.label_shift = round(config.fps_at_recording_time / config.fps_at_test_time) if shift_labels else 0
+        self.label_shift = (
+            round(config.fps_at_recording_time / config.fps_at_test_time)
+            if shift_labels
+            else 0
+        )
         self.transform = transform
-        self.data_files = [os.path.join(data_dir, f) for data_dir in data_dirs for f in sorted(os.listdir(data_dir)) if f.endswith('.h5')]
+        self.data_files = [
+            os.path.join(data_dir, f)
+            for data_dir in data_dirs
+            for f in sorted(os.listdir(data_dir))
+            if f.endswith(".h5")
+        ]
+        self._file_handles = {}
         self.lookup_table = self._create_lookup_table()
 
-        self.train_transform_with_zoom = A.Compose([
-            A.Affine(scale=(1.05, 1.2), p=self.zoom_prob),
-            color_jitter_replace,
-            RandomSkyMask(height_limit=(0.3, 0.4), p=0.25),
-        ], additional_targets=additional_targets)
+        self.train_transform_with_zoom = A.Compose(
+            [
+                A.Affine(scale=(1.05, 1.2), p=self.zoom_prob),
+                color_jitter_replace,
+                RandomSkyMask(height_limit=(0.3, 0.4), p=0.25),
+            ],
+            additional_targets=additional_targets,
+        )
 
     def _create_lookup_table(self):
         lookup = []
         total_samples = 0
         # this is dumb but I don't want to make a new function in the child class
-        seq_len = 1 if not hasattr(self, 'sequence_len') else self.sequence_len
-        seq_stride = 0 if not hasattr(self, 'sequence_stride') else self.sequence_stride
+        seq_len = 1 if not hasattr(self, "sequence_len") else self.sequence_len
+        seq_stride = 0 if not hasattr(self, "sequence_stride") else self.sequence_stride
         effective_sequence_length = (seq_len - 1) * seq_stride + self.label_shift
-        # precompute per-file stuck start offsets, align with self.data_files
-        self._stuck_offsets = []
+        valid_files = []
+        valid_stuck_offsets = []
         for file_path in self.data_files:
             stuck_start = _compute_stuck_start_idx(file_path)
-            self._stuck_offsets.append(stuck_start)
-            with h5py.File(file_path, 'r', libver='latest', swmr=True) as f:
-                file_samples = f['labels'].shape[0]
+            with h5py.File(file_path, "r", libver="latest", swmr=True) as f:
+                file_samples = f["labels"].shape[0]
                 file_samples -= effective_sequence_length
                 if "stuck" in file_path:
                     # cut away everything before the first correct 's' frame
                     file_samples -= max(stuck_start - effective_sequence_length, 0)
                 if file_samples <= 0:
-                    print(f"Skipping and removing {file_path} as it has {file_samples} samples (no valid samples)")
-                    self.data_files.remove(file_path)
+                    print(
+                        f"Skipping and removing {file_path} as it has {file_samples} samples (no valid samples)"
+                    )
                     continue
                 total_samples += file_samples
-            lookup.append(total_samples)
+                lookup.append(total_samples)
+                valid_files.append(file_path)
+                valid_stuck_offsets.append(stuck_start)
+        self.data_files = valid_files
+        self._stuck_offsets = valid_stuck_offsets
         return lookup
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_file_handles"] = {}
+        return state
+
+    def _ensure_handle(self, file_idx):
+        handle = self._file_handles.get(file_idx)
+        if handle is None or not handle.id.valid:
+            handle = h5py.File(
+                self.data_files[file_idx], "r", libver="latest", swmr=True
+            )
+            self._file_handles[file_idx] = handle
+        return handle
+
+    def _close_file_handles(self):
+        handles = getattr(self, "_file_handles", None)
+        if not handles:
+            self._file_handles = {}
+            return
+        for handle in handles.values():
+            try:
+                handle.close()
+            except Exception:
+                pass
+        self._file_handles = {}
+
+    def __del__(self):
+        self._close_file_handles()
 
     def __len__(self):
         train_split_len = self._get_split_idx()
@@ -113,17 +169,17 @@ class H5Dataset(Dataset):
             start_k = self._stuck_offsets[file_idx]
             local_idx += max(start_k - self.label_shift, 0)
 
-        with h5py.File(file_path, 'r', libver='latest', swmr=True) as f:
-            image = f['images'][local_idx]
-            label = f['labels'][local_idx + self.label_shift]
-            if self.classifier_type == "bce":
-                label = label.astype(np.int8).flatten()
-                label = self._to_wasd(label)
-            else:
-                label = label.flatten().astype(np.float32)
+        f = self._ensure_handle(file_idx)
+        image = f["images"][local_idx]
+        label = f["labels"][local_idx + self.label_shift]
+        if self.classifier_type == "bce":
+            label = label.astype(np.int8).flatten()
+            label = self._to_wasd(label)
+        else:
+            label = label.flatten().astype(np.float32)
         image, label, warped = self.apply_custom_augmentations(image, label)
         image = self.augment_without_minimap([image], warped)[0]
-        image = self.transform(image=image)['image']
+        image = self.transform(image=image)["image"]
 
         return image, label
 
@@ -180,9 +236,15 @@ class H5Dataset(Dataset):
         minimaps = [img[y1:y2, x1:x2] for img in images]
         # for zoom we would technically need to inpaint, becuase between edge and minimap there will be the small edge
         # of the old minimap, but the performance hit is massive for some reason
-        transform_to_use = train_transform_no_zoom if warped else self.train_transform_with_zoom
-        augmented_images = transform_to_use(**{'image' if i == 0 else f'image{i}': img for i, img in enumerate(images)})
-        augmented_images = [augmented_images['image']] + [augmented_images[f'image{i}'] for i in range(1, len(images))]
+        transform_to_use = (
+            train_transform_no_zoom if warped else self.train_transform_with_zoom
+        )
+        augmented_images = transform_to_use(
+            **{"image" if i == 0 else f"image{i}": img for i, img in enumerate(images)}
+        )
+        augmented_images = [augmented_images["image"]] + [
+            augmented_images[f"image{i}"] for i in range(1, len(images))
+        ]
 
         for img, minimap in zip(augmented_images, minimaps):
             img[y1:y2, x1:x2] = minimap
@@ -190,10 +252,31 @@ class H5Dataset(Dataset):
 
 
 class TimeSeriesDataset(H5Dataset):
-    def __init__(self, data_dirs, train_split, is_train, classifier_type, flip_prob, warp_prob, zoom_prob, sequence_len, sequence_stride, shift_labels=True):
+    def __init__(
+        self,
+        data_dirs,
+        train_split,
+        is_train,
+        classifier_type,
+        flip_prob,
+        warp_prob,
+        zoom_prob,
+        sequence_len,
+        sequence_stride,
+        shift_labels=True,
+    ):
         self.sequence_len = sequence_len
         self.sequence_stride = sequence_stride
-        super().__init__(data_dirs, train_split, is_train, classifier_type, flip_prob, warp_prob, zoom_prob, shift_labels)
+        super().__init__(
+            data_dirs,
+            train_split,
+            is_train,
+            classifier_type,
+            flip_prob,
+            warp_prob,
+            zoom_prob,
+            shift_labels,
+        )
 
     def __getitem__(self, idx):
         if not self.is_train:
@@ -207,19 +290,27 @@ class TimeSeriesDataset(H5Dataset):
         if "stuck" in file_path:
             start_k = self._stuck_offsets[file_idx]
             local_idx += max(start_k - sequence_range - self.label_shift, 0)
-        with h5py.File(file_path, 'r', libver='latest', swmr=True) as f:
-            # Get sequence with stride
-            img_indices = range(local_idx, local_idx + self.sequence_len * self.sequence_stride, self.sequence_stride)
-            label_indices = range(local_idx + self.label_shift, local_idx + self.label_shift + self.sequence_len * self.sequence_stride, self.sequence_stride)
-            images = f['images'][img_indices]
-            labels = f['labels'][label_indices]
+        f = self._ensure_handle(file_idx)
+        # Get sequence with stride
+        img_indices = range(
+            local_idx,
+            local_idx + self.sequence_len * self.sequence_stride,
+            self.sequence_stride,
+        )
+        label_indices = range(
+            local_idx + self.label_shift,
+            local_idx + self.label_shift + self.sequence_len * self.sequence_stride,
+            self.sequence_stride,
+        )
+        images = f["images"][img_indices]
+        labels = f["labels"][label_indices]
         if self.classifier_type == "bce":
             labels = self._to_wasd(labels.astype(np.int8))
         else:
             labels = labels.astype(np.float32)
         images, labels, warped = self.apply_custom_augmentations(images, labels)
         images = self.augment_without_minimap(images, warped)
-        images = stack([self.transform(image=img)['image'] for img in images], dim=0)
+        images = stack([self.transform(image=img)["image"] for img in images], dim=0)
         return images, labels
 
 
@@ -231,7 +322,7 @@ def warp_samples(images, labels):
         return images, labels.squeeze()
 
     shift = random.randint(min_warp_shift, max_warp_shift)
-    direction = 'left' if random.random() < 0.5 else 'right'
+    direction = "left" if random.random() < 0.5 else "right"
     labels = handle_labels_warp(labels, direction)
     if images.ndim == 3:
         return diagonal_warp(images, shift, direction), labels
@@ -244,8 +335,8 @@ def handle_labels_warp(labels, direction):
     # not sure if we should adjust the non last labels, for now we don't use them though
     # if the image was shifted to the left, from car pov it looks like we
     # are more right than before, so we should correct by steering left
-    if direction == 'left':
-        labels[-1][1] = 1   # [w, a, s, d]
+    if direction == "left":
+        labels[-1][1] = 1  # [w, a, s, d]
     else:
         labels[-1][3] = 1
     return labels.squeeze()
@@ -265,10 +356,10 @@ def diagonal_warp(image, shift, direction):
     # This just works, no need to black out the minimap
     image = cv2.inpaint(image, minimap_mask, inpaintRadius=3, flags=cv2.INPAINT_NS)
     # Generate shift values for each row, this makes it so the shift is from the center, so both top and bottom "drift"
-    if direction == 'left':
-        row_shifts = np.linspace(-int(shift/2), int(shift/2), height, dtype=int)
+    if direction == "left":
+        row_shifts = np.linspace(-int(shift / 2), int(shift / 2), height, dtype=int)
     else:
-        row_shifts = np.linspace(int(shift/2), -int(shift/2), height, dtype=int)
+        row_shifts = np.linspace(int(shift / 2), -int(shift / 2), height, dtype=int)
 
     # Create meshgrid for indices
     x_indices = np.tile(np.arange(width), (height, 1))
@@ -278,10 +369,12 @@ def diagonal_warp(image, shift, direction):
     image = image[np.arange(height)[:, None], shifted_indices]
 
     # Apply zoom using Albumentations
-    zoom_transform = A.Compose([
-        A.Affine(scale=1 + (shift / width), p=1),
-    ])
-    image = zoom_transform(image=image)['image']
+    zoom_transform = A.Compose(
+        [
+            A.Affine(scale=1 + (shift / width), p=1),
+        ]
+    )
+    image = zoom_transform(image=image)["image"]
     # Reinsert the minimap back into the warped image
     image[y1:y2, x1:x2] = minimap
 
@@ -307,38 +400,51 @@ def flip_image_with_minimap(image):
     return image
 
 
-color_jitter_replace = A.OneOf([
-    # Increased range to help with darker conditions (tunnels)
-    A.RandomBrightnessContrast(brightness_limit=(-0.3, 0.1), contrast_limit=(-0.1, 0.3), p=0.7),
-    
-    # Expanded gamma range to emphasize darker conditions
-    A.RandomGamma(gamma_limit=(60, 110), p=0.6),
-    
-    # Slightly increased value range for lighting variance
-    A.HueSaturationValue(hue_shift_limit=10, sat_shift_limit=15, val_shift_limit=(-15, 5), p=0.5),
-    
-    # Slight blue shift more likely (for shadow simulation)
-    A.RGBShift(r_shift_limit=(-5, 10), g_shift_limit=(-5, 10), b_shift_limit=(0, 15), p=0.4),
-], p=jitter_p)
+color_jitter_replace = A.OneOf(
+    [
+        # Increased range to help with darker conditions (tunnels)
+        A.RandomBrightnessContrast(
+            brightness_limit=(-0.3, 0.1), contrast_limit=(-0.1, 0.3), p=0.7
+        ),
+        # Expanded gamma range to emphasize darker conditions
+        A.RandomGamma(gamma_limit=(60, 110), p=0.6),
+        # Slightly increased value range for lighting variance
+        A.HueSaturationValue(
+            hue_shift_limit=10, sat_shift_limit=15, val_shift_limit=(-15, 5), p=0.5
+        ),
+        # Slight blue shift more likely (for shadow simulation)
+        A.RGBShift(
+            r_shift_limit=(-5, 10), g_shift_limit=(-5, 10), b_shift_limit=(0, 15), p=0.4
+        ),
+    ],
+    p=jitter_p,
+)
 
 
 # not sure about the zoom augmentation, i think it causes training to be quite a bit worse, especially
 # because I don't account for if the image has been warped already to not zoom. (easy but a bit annoying to do)
 # Define two different transforms so that we can dynamically zoom or not (because we need to account if we warped before)
-additional_targets = {f'image{i}': 'image' for i in range(1, config.sequence_len)}
+additional_targets = {f"image{i}": "image" for i in range(1, config.sequence_len)}
 # zoom transform moved to class so that we can control the zoom param
 
-train_transform_no_zoom = A.Compose([
-    color_jitter_replace,
-    RandomSkyMask(height_limit=(0.3, 0.4), p=0.25),
-], additional_targets=additional_targets)
+train_transform_no_zoom = A.Compose(
+    [
+        color_jitter_replace,
+        RandomSkyMask(height_limit=(0.3, 0.4), p=0.25),
+    ],
+    additional_targets=additional_targets,
+)
 
 
-transform = A.Compose([
-    A.PadIfNeeded(min_height=height, min_width=width, border_mode=cv2.BORDER_CONSTANT, fill=0),
-    A.Normalize(mean=ADE_MEAN, std=ADE_STD, max_pixel_value=255.0),
-    ToTensorV2(),
-])
+transform = A.Compose(
+    [
+        A.PadIfNeeded(
+            min_height=height, min_width=width, border_mode=cv2.BORDER_CONSTANT, fill=0
+        ),
+        A.Normalize(mean=ADE_MEAN, std=ADE_STD, max_pixel_value=255.0),
+        ToTensorV2(),
+    ]
+)
 
 
 def _compute_stuck_start_idx(file_path):
@@ -349,22 +455,56 @@ def _compute_stuck_start_idx(file_path):
     if "stuck" not in file_path:
         return 0
     outputs_s_idx = config.outputs.get("s", 2)
-    with h5py.File(file_path, 'r', libver='latest', swmr=True) as f:
-        num_labels = f['labels'].shape[0]
+    with h5py.File(file_path, "r", libver="latest", swmr=True) as f:
+        num_labels = f["labels"].shape[0]
         base = min(config.amt_remove_after_pause, num_labels)
         if base >= num_labels:
             return base
-        s_col = np.array(f['labels'][base:, outputs_s_idx])
+        s_col = np.array(f["labels"][base:, outputs_s_idx])
         s_hits = np.where(s_col == 1)[0]
         return base + int(s_hits[0]) if s_hits.size > 0 else base
 
-def get_dataloader(data_dir, batch_size, train_split, is_train, classifier_type, sequence_len=1, 
-                  sequence_stride=1, flip_prob=0., warp_prob=0., zoom_prob=0., shift_labels=True, shuffle=True,
-                  num_workers=0, persistent_workers=True):
+
+def get_dataloader(
+    data_dir,
+    batch_size,
+    train_split,
+    is_train,
+    classifier_type,
+    sequence_len=1,
+    sequence_stride=1,
+    flip_prob=0.0,
+    warp_prob=0.0,
+    zoom_prob=0.0,
+    shift_labels=True,
+    shuffle=True,
+    num_workers=0,
+    persistent_workers=True,
+):
     if sequence_len > 1:
-        dataset = TimeSeriesDataset(data_dir, train_split, is_train, classifier_type, flip_prob, warp_prob, zoom_prob, sequence_len, sequence_stride, shift_labels)
+        dataset = TimeSeriesDataset(
+            data_dir,
+            train_split,
+            is_train,
+            classifier_type,
+            flip_prob,
+            warp_prob,
+            zoom_prob,
+            sequence_len,
+            sequence_stride,
+            shift_labels,
+        )
     else:
-        dataset = H5Dataset(data_dir, train_split, is_train, classifier_type, flip_prob, warp_prob, zoom_prob, shift_labels)
+        dataset = H5Dataset(
+            data_dir,
+            train_split,
+            is_train,
+            classifier_type,
+            flip_prob,
+            warp_prob,
+            zoom_prob,
+            shift_labels,
+        )
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -383,11 +523,22 @@ def invNormalize(x):
 
 
 def test_dataloader():
-    data_dirs = ['data/turns']
+    data_dirs = ["data/turns"]
     sequence_len = 3
     # Test with workers
-    train_loader = get_dataloader(data_dirs, 32, 0.95, True, "bce", sequence_len, 20, 0., 0.0, True, 
-                                  num_workers=2)  # Try with 2 workers for testing
+    train_loader = get_dataloader(
+        data_dirs,
+        32,
+        0.95,
+        True,
+        "bce",
+        sequence_len,
+        20,
+        0.0,
+        0.0,
+        True,
+        num_workers=2,
+    )  # Try with 2 workers for testing
     # vizualize data with matplotlib until stopped
     for data, label in train_loader:
         for i in range(data.shape[0]):
@@ -405,34 +556,57 @@ def test_dataloader():
                 print(label[i])
                 plt.imshow(img)
                 plt.show()
-  
-    
+
+
 def test_stuck_offsets_and_getitem():
     data_dirs = [config.stuck_data_dir_name]
     # Build a normal dataloader (batch_size=1, no shuffle for deterministic indexing)
-    loader = get_dataloader(data_dirs, batch_size=1, train_split=1.0, is_train=True, classifier_type="bce", shuffle=False, num_workers=0)
+    loader = get_dataloader(
+        data_dirs,
+        batch_size=1,
+        train_split=1.0,
+        is_train=True,
+        classifier_type="bce",
+        shuffle=False,
+        num_workers=0,
+    )
     dataset = loader.dataset
     print(f"Total samples: {len(dataset)} across {len(dataset.data_files)} files")
     print("Per-file first-correct indices and getitem checks (single frame):")
     for i, fp in enumerate(dataset.data_files):
-        offset = dataset._stuck_offsets[i] if hasattr(dataset, '_stuck_offsets') else 0
+        offset = dataset._stuck_offsets[i] if hasattr(dataset, "_stuck_offsets") else 0
         start_global_idx = 0 if i == 0 else dataset.lookup_table[i - 1]
         _, label = dataset[start_global_idx]
         s_val = int(label[2]) if label.ndim == 1 else int(label[..., 2])
-        print(f"{i}: {fp} | offset={offset} | first_global_idx={start_global_idx} | label_s={s_val}")
+        print(
+            f"{i}: {fp} | offset={offset} | first_global_idx={start_global_idx} | label_s={s_val}"
+        )
 
     # TimeSeries check
-    ts_dataset = TimeSeriesDataset(data_dirs, train_split=1.0, is_train=True, classifier_type="bce", flip_prob=0.0, warp_prob=0.0, zoom_prob=0.0,
-                                   sequence_len=config.sequence_len, sequence_stride=config.sequence_stride, shift_labels=True)
+    ts_dataset = TimeSeriesDataset(
+        data_dirs,
+        train_split=1.0,
+        is_train=True,
+        classifier_type="bce",
+        flip_prob=0.0,
+        warp_prob=0.0,
+        zoom_prob=0.0,
+        sequence_len=config.sequence_len,
+        sequence_stride=config.sequence_stride,
+        shift_labels=True,
+    )
     print("Per-file first-correct indices and getitem checks (time series):")
     for i, fp in enumerate(ts_dataset.data_files):
-        offset = ts_dataset._stuck_offsets[i] if hasattr(ts_dataset, '_stuck_offsets') else 0
+        offset = (
+            ts_dataset._stuck_offsets[i] if hasattr(ts_dataset, "_stuck_offsets") else 0
+        )
         start_global_idx = 0 if i == 0 else ts_dataset.lookup_table[i - 1]
         _, labels = ts_dataset[start_global_idx]
         s_val_last = int(labels[-1][2])
-        print(f"{i}: {fp} | offset={offset} | first_global_idx={start_global_idx} | last_label_s={s_val_last}")
+        print(
+            f"{i}: {fp} | offset={offset} | first_global_idx={start_global_idx} | last_label_s={s_val_last}"
+        )
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     test_stuck_offsets_and_getitem()
-  
