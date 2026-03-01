@@ -11,6 +11,7 @@ from contextlib import nullcontext
 from pathlib import Path
 
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
@@ -98,7 +99,9 @@ class ChunkedRandomSampler(Sampler[int]):
 
 
 class AsyncBatchPrefetcher:
-    def __init__(self, loader, device: torch.device, prefetch_batches: int = 2, **_ignored):
+    def __init__(
+        self, loader, device: torch.device, prefetch_batches: int = 2, **_ignored
+    ):
         self.loader = loader
         self.device = torch.device(device)
         self.prefetch_batches = max(int(prefetch_batches), 1)
@@ -117,7 +120,9 @@ class AsyncBatchPrefetcher:
         if isinstance(batch, list):
             return [AsyncBatchPrefetcher._to_device(v, device) for v in batch]
         if isinstance(batch, dict):
-            return {k: AsyncBatchPrefetcher._to_device(v, device) for k, v in batch.items()}
+            return {
+                k: AsyncBatchPrefetcher._to_device(v, device) for k, v in batch.items()
+            }
         return batch
 
     @staticmethod
@@ -183,7 +188,7 @@ def _strip_compile_prefix(state_dict: dict) -> dict:
     cleaned = {}
     for key, value in state_dict.items():
         if key.startswith(UNWANTED_PREFIX):
-            cleaned[key[len(UNWANTED_PREFIX):]] = value
+            cleaned[key[len(UNWANTED_PREFIX) :]] = value
         else:
             cleaned[key] = value
     return cleaned
@@ -226,10 +231,26 @@ class PrecomputedFeatureDataset(Dataset):
         self.file_boundaries = self.metadata["file_boundaries"]
         self.stuck_offsets = self.metadata["stuck_offsets"]
 
-        self.sequence_len = int(sequence_len if sequence_len is not None else self.metadata.get("sequence_len", 3))
-        self.sequence_stride = int(sequence_stride if sequence_stride is not None else self.metadata.get("sequence_stride", 10))
-        self.label_shift = int(label_shift if label_shift is not None else self.metadata.get("label_shift", 0))
-        self.train_split = float(train_split if train_split is not None else self.metadata.get("train_split", 0.95))
+        self.sequence_len = int(
+            sequence_len
+            if sequence_len is not None
+            else self.metadata.get("sequence_len", 3)
+        )
+        self.sequence_stride = int(
+            sequence_stride
+            if sequence_stride is not None
+            else self.metadata.get("sequence_stride", 10)
+        )
+        self.label_shift = int(
+            label_shift
+            if label_shift is not None
+            else self.metadata.get("label_shift", 0)
+        )
+        self.train_split = float(
+            train_split
+            if train_split is not None
+            else self.metadata.get("train_split", 0.95)
+        )
 
         self.feature_shape = (self.num_images, self.num_tokens, self.embed_dim)
         self.feature_paths = []
@@ -245,7 +266,9 @@ class PrecomputedFeatureDataset(Dataset):
         labels_probe = np.load(labels_path, mmap_mode="r")
         labels_shape = tuple(int(dim) for dim in labels_probe.shape)
         if labels_shape[0] != self.num_images:
-            raise RuntimeError(f"labels shape mismatch: {labels_shape[0]} != metadata.num_images={self.num_images}")
+            raise RuntimeError(
+                f"labels shape mismatch: {labels_shape[0]} != metadata.num_images={self.num_images}"
+            )
         handle = getattr(labels_probe, "_mmap", None)
         if handle is not None:
             handle.close()
@@ -307,7 +330,9 @@ class PrecomputedFeatureDataset(Dataset):
         active_files = []
         total_samples = 0
 
-        effective_sequence_length = (self.sequence_len - 1) * self.sequence_stride + self.label_shift
+        effective_sequence_length = (
+            self.sequence_len - 1
+        ) * self.sequence_stride + self.label_shift
         for file_idx, file_len in enumerate(self.file_lengths):
             file_samples = file_len - effective_sequence_length
             file_path = str(self.file_paths[file_idx])
@@ -355,10 +380,14 @@ class PrecomputedFeatureDataset(Dataset):
             start_k = int(self.stuck_offsets[file_idx])
             local_idx += max(start_k - sequence_range - self.label_shift, 0)
 
-        img_indices_local = np.array([local_idx + i * self.sequence_stride for i in range(self.sequence_len)], dtype=np.int64)
+        img_indices_local = np.array(
+            [local_idx + i * self.sequence_stride for i in range(self.sequence_len)],
+            dtype=np.int64,
+        )
         label_indices_local = np.array(
             [
-            local_idx + self.label_shift + i * self.sequence_stride for i in range(self.sequence_len)
+                local_idx + self.label_shift + i * self.sequence_stride
+                for i in range(self.sequence_len)
             ],
             dtype=np.int64,
         )
@@ -399,10 +428,14 @@ class PrecomputedFeatureDataset(Dataset):
         out = [None] * batch_size
 
         for version_idx, grouped_records in grouped.items():
-            all_img_indices = np.concatenate([rec["img_indices"] for rec in grouped_records])
+            all_img_indices = np.concatenate(
+                [rec["img_indices"] for rec in grouped_records]
+            )
             img_order = np.argsort(all_img_indices, kind="stable")
             sorted_img = all_img_indices[img_order]
-            sorted_features = np.asarray(features_memmaps[version_idx][sorted_img], dtype=np.float16)
+            sorted_features = np.asarray(
+                features_memmaps[version_idx][sorted_img], dtype=np.float16
+            )
             inv_img_order = np.empty_like(img_order)
             inv_img_order[img_order] = np.arange(img_order.size)
             grouped_features = sorted_features[inv_img_order].reshape(
@@ -412,12 +445,18 @@ class PrecomputedFeatureDataset(Dataset):
                 self.embed_dim,
             )
 
-            all_label_indices = np.concatenate([rec["label_indices"] for rec in grouped_records])
+            all_label_indices = np.concatenate(
+                [rec["label_indices"] for rec in grouped_records]
+            )
             label_order = np.argsort(all_label_indices, kind="stable")
-            sorted_labels = np.asarray(labels_memmap[all_label_indices[label_order]], dtype=np.float32)
+            sorted_labels = np.asarray(
+                labels_memmap[all_label_indices[label_order]], dtype=np.float32
+            )
             inv_label_order = np.empty_like(label_order)
             inv_label_order[label_order] = np.arange(label_order.size)
-            grouped_labels = sorted_labels[inv_label_order].reshape(len(grouped_records), self.sequence_len, -1)
+            grouped_labels = sorted_labels[inv_label_order].reshape(
+                len(grouped_records), self.sequence_len, -1
+            )
 
             version_meta = self.version_info[version_idx]
             aug_type = version_meta.get("type", "unaltered")
@@ -430,9 +469,13 @@ class PrecomputedFeatureDataset(Dataset):
                     labels[:, [1, 3]] = labels[:, [3, 1]]
                 elif aug_type == "warped":
                     last_label = labels[-1]
-                    qualifies = np.array_equal(last_label, VALID_WARP_LABEL) or np.array_equal(last_label, ZERO_LABEL)
+                    qualifies = np.array_equal(
+                        last_label, VALID_WARP_LABEL
+                    ) or np.array_equal(last_label, ZERO_LABEL)
                     if not qualifies:
-                        features = np.asarray(features_memmaps[0][rec["img_indices"]], dtype=np.float16)
+                        features = np.asarray(
+                            features_memmaps[0][rec["img_indices"]], dtype=np.float16
+                        )
                     else:
                         direction = version_meta.get("warp_direction", "left")
                         if direction == "left":
@@ -440,7 +483,9 @@ class PrecomputedFeatureDataset(Dataset):
                         else:
                             labels[-1, 3] = 1.0
 
-                flat = np.asarray(features, dtype=np.float16).reshape(self.sequence_len * self.num_tokens, self.embed_dim)
+                flat = np.asarray(features, dtype=np.float16).reshape(
+                    self.sequence_len * self.num_tokens, self.embed_dim
+                )
                 out[rec["out_idx"]] = (
                     torch.from_numpy(flat),
                     torch.from_numpy(labels.astype(np.float32, copy=False)),
@@ -518,7 +563,9 @@ class HeadOnlyModel(nn.Module):
 
         projection_params = []
         if self.projection is not None:
-            projection_params = [p for p in self.projection.parameters() if p.requires_grad]
+            projection_params = [
+                p for p in self.projection.parameters() if p.requires_grad
+            ]
 
         proj_decay = [p for p in projection_params if p.ndim >= 2]
         proj_nodecay = [p for p in projection_params if p.ndim < 2]
@@ -528,9 +575,26 @@ class HeadOnlyModel(nn.Module):
         adam_nodecay += proj_nodecay
 
         param_groups = [
-            dict(params=hidden_weights, use_muon=True, lr=muon_lr, weight_decay=weight_decay),
-            dict(params=adam_decay, use_muon=False, lr=learning_rate, betas=betas, weight_decay=weight_decay),
-            dict(params=adam_nodecay, use_muon=False, lr=learning_rate, betas=betas, weight_decay=0.0),
+            dict(
+                params=hidden_weights,
+                use_muon=True,
+                lr=muon_lr,
+                weight_decay=weight_decay,
+            ),
+            dict(
+                params=adam_decay,
+                use_muon=False,
+                lr=learning_rate,
+                betas=betas,
+                weight_decay=weight_decay,
+            ),
+            dict(
+                params=adam_nodecay,
+                use_muon=False,
+                lr=learning_rate,
+                betas=betas,
+                weight_decay=0.0,
+            ),
         ]
         return SingleDeviceMuonWithAuxAdam(param_groups)
 
@@ -554,7 +618,12 @@ class HeadOnlyModel(nn.Module):
 
         keep = {}
         for key, value in state_dict.items():
-            if key == "cls_token" or key.startswith("projection.") or key.startswith("transformer.") or key.startswith("fc_head."):
+            if (
+                key == "cls_token"
+                or key.startswith("projection.")
+                or key.startswith("transformer.")
+                or key.startswith("fc_head.")
+            ):
                 keep[key] = value
 
         model = cls(
@@ -570,11 +639,15 @@ class HeadOnlyModel(nn.Module):
         )
         msg = model.load_state_dict(keep, strict=False)
         print(f"Loaded head checkpoint: {checkpoint_path}")
-        print(f"Missing keys: {len(msg.missing_keys)} | Unexpected keys: {len(msg.unexpected_keys)}")
+        print(
+            f"Missing keys: {len(msg.missing_keys)} | Unexpected keys: {len(msg.unexpected_keys)}"
+        )
         return model
 
 
-def get_lr(it, warmup_iters, lr_decay_iters, learning_rate, min_lr, lr_restart_cycles=1):
+def get_lr(
+    it, warmup_iters, lr_decay_iters, learning_rate, min_lr, lr_restart_cycles=1
+):
     if it < warmup_iters:
         return learning_rate * it / warmup_iters
     if it > lr_decay_iters:
@@ -621,7 +694,9 @@ def update_lr(args, optimizer, current_lr, iter_num):
 
 
 @torch.no_grad()
-def calc_accuracy(logits: torch.Tensor, labels: torch.Tensor, return_per_class: bool = False):
+def calc_accuracy(
+    logits: torch.Tensor, labels: torch.Tensor, return_per_class: bool = False
+):
     preds = torch.sigmoid(logits.float()) >= 0.5
     targets = labels[:, -1].to(dtype=torch.bool, device=preds.device)
     exact = (preds == targets).all(dim=-1).float().mean().item()
@@ -634,13 +709,17 @@ def calc_accuracy(logits: torch.Tensor, labels: torch.Tensor, return_per_class: 
     per_class_total = np.mean(preds_np == targets_np, axis=0)
     per_class_recall = np.array(
         [
-            np.mean(preds_np[targets_np[:, i], i]) if np.any(targets_np[:, i]) else np.nan
+            np.mean(preds_np[targets_np[:, i], i])
+            if np.any(targets_np[:, i])
+            else np.nan
             for i in range(targets_np.shape[1])
         ]
     )
     per_class_spec = np.array(
         [
-            np.mean(~preds_np[~targets_np[:, i], i]) if np.any(~targets_np[:, i]) else np.nan
+            np.mean(~preds_np[~targets_np[:, i], i])
+            if np.any(~targets_np[:, i])
+            else np.nan
             for i in range(targets_np.shape[1])
         ]
     )
@@ -658,7 +737,9 @@ def _next_batch(loader, loader_iter):
             return None, loader_iter
 
 
-def _move_to_device_if_needed(tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
+def _move_to_device_if_needed(
+    tensor: torch.Tensor, device: torch.device
+) -> torch.Tensor:
     if tensor.device == device:
         return tensor
     if device.type == "cuda" and tensor.device.type == "cpu":
@@ -738,9 +819,9 @@ def print_eval(iter_num, eval_stats):
     print("Class | TrainTot | ValTot | TrainRec | ValRec | TrainSpec | ValSpec")
     for i, name in enumerate(names):
         print(
-            f"{name:>5} | {train_total[i]*100:>7.2f}% | {val_total[i]*100:>6.2f}% | "
-            f"{train_recall[i]*100:>8.2f}% | {val_recall[i]*100:>6.2f}% | "
-            f"{train_spec[i]*100:>9.2f}% | {val_spec[i]*100:>7.2f}%"
+            f"{name:>5} | {train_total[i] * 100:>7.2f}% | {val_total[i] * 100:>6.2f}% | "
+            f"{train_recall[i] * 100:>8.2f}% | {val_recall[i] * 100:>6.2f}% | "
+            f"{train_spec[i] * 100:>9.2f}% | {val_spec[i] * 100:>7.2f}%"
         )
     print("=" * 80)
 
@@ -748,23 +829,66 @@ def print_eval(iter_num, eval_stats):
 def plot_metrics(metrics: dict, output_path: Path, smooth_window: int = 50):
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 9), sharex=True)
 
-    ax1.plot(metrics["iters"], metrics["train_loss"], alpha=0.25, color="#1f77b4", label="Train Loss")
+    ax1.plot(
+        metrics["iters"],
+        metrics["train_loss"],
+        alpha=0.25,
+        color="#1f77b4",
+        label="Train Loss",
+    )
     smoothed = _moving_average(metrics["train_loss"], smooth_window)
     if smoothed.size > 0:
         idx0 = smooth_window - 1
-        ax1.plot(metrics["iters"][idx0:idx0 + smoothed.shape[0]], smoothed, color="#1f77b4", label="Train Loss (smoothed)")
-    ax1.plot(metrics["eval_iters"], metrics["val_loss"], color="#d62728", marker="o", linestyle="--", label="Val Loss")
+        ax1.plot(
+            metrics["iters"][idx0 : idx0 + smoothed.shape[0]],
+            smoothed,
+            color="#1f77b4",
+            label="Train Loss (smoothed)",
+        )
+    ax1.plot(
+        metrics["eval_iters"],
+        metrics["val_loss"],
+        color="#d62728",
+        marker="o",
+        linestyle="--",
+        label="Val Loss",
+    )
     ax1.set_ylabel("Loss")
     ax1.legend(loc="upper right")
     ax1.grid(alpha=0.3)
 
-    ax2.plot(metrics["iters"], metrics["train_acc"], alpha=0.25, color="#2ca02c", label="Train Acc")
+    ax2.plot(
+        metrics["iters"],
+        metrics["train_acc"],
+        alpha=0.25,
+        color="#2ca02c",
+        label="Train Acc",
+    )
     smoothed_acc = _moving_average(metrics["train_acc"], smooth_window)
     if smoothed_acc.size > 0:
         idx0 = smooth_window - 1
-        ax2.plot(metrics["iters"][idx0:idx0 + smoothed_acc.shape[0]], smoothed_acc, color="#2ca02c", label="Train Acc (smoothed)")
-    ax2.plot(metrics["eval_iters"], metrics["eval_train_acc"], color="#9467bd", marker="s", linestyle="--", label="Eval Train Acc")
-    ax2.plot(metrics["eval_iters"], metrics["val_acc"], color="#ff7f0e", marker="o", linestyle="--", label="Val Acc")
+        ax2.plot(
+            metrics["iters"][idx0 : idx0 + smoothed_acc.shape[0]],
+            smoothed_acc,
+            color="#2ca02c",
+            label="Train Acc (smoothed)",
+        )
+    ax2.plot(
+        metrics["eval_iters"],
+        metrics["eval_train_acc"],
+        color="#9467bd",
+        marker="s",
+        linestyle="--",
+        label="Eval Train Acc",
+    )
+    ax2.plot(
+        metrics["eval_iters"],
+        metrics["val_acc"],
+        color="#ff7f0e",
+        marker="o",
+        linestyle="--",
+        label="Val Acc",
+    )
     ax2.set_xlabel("Iteration")
     ax2.set_ylabel("Accuracy")
     ax2.legend(loc="lower right")
@@ -781,7 +905,10 @@ def save_checkpoint(model, optimizer, args, iter_num, best_val_loss, out_path: P
     filtered = {
         key: value
         for key, value in state_dict.items()
-        if key == "cls_token" or key.startswith("transformer.") or key.startswith("fc_head.")
+        if key == "cls_token"
+        or key.startswith("projection.")
+        or key.startswith("transformer.")
+        or key.startswith("fc_head.")
     }
     ckpt = {
         "model": filtered,
@@ -794,7 +921,9 @@ def save_checkpoint(model, optimizer, args, iter_num, best_val_loss, out_path: P
 
 
 def create_arg_parser():
-    parser = argparse.ArgumentParser(description="Train transformer head on precomputed DINOv3 features")
+    parser = argparse.ArgumentParser(
+        description="Train transformer head on precomputed DINOv3 features"
+    )
     parser.add_argument("--feature_dir", type=str, required=True)
     parser.add_argument("--checkpoint_path", type=str, default="")
     parser.add_argument("--out_dir", type=str, default="models/feature_head")
@@ -820,7 +949,7 @@ def create_arg_parser():
     parser.add_argument("--log_interval", type=int, default=10)
     parser.add_argument("--log_memory_interval", type=int, default=0)
     parser.add_argument("--eval_interval", type=int, default=500)
-    parser.add_argument("--eval_iters", type=int, default=10)
+    parser.add_argument("--eval_iters", type=int, default=50)
 
     parser.add_argument("--learning_rate", type=float, default=5e-5)
     parser.add_argument("--muon_lr", type=float, default=0.0015)
@@ -846,12 +975,24 @@ def create_arg_parser():
     parser.add_argument("--async_prefetch_batches", type=int, default=2)
     parser.add_argument("--shuffle_chunk_size", type=int, default=4096)
     parser.add_argument("--seed", type=int, default=1337)
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--dtype", type=str, default="bfloat16" if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else "float16")
-    parser.add_argument("--compile", type=_parse_bool, nargs="?", const=True, default=True)
+    parser.add_argument(
+        "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
+    )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default="bfloat16"
+        if torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+        else "float16",
+    )
+    parser.add_argument(
+        "--compile", type=_parse_bool, nargs="?", const=True, default=True
+    )
     parser.add_argument("--no_compile", action="store_false", dest="compile")
     parser.add_argument("--resume_optimizer", action="store_true", default=True)
-    parser.add_argument("--no_resume_optimizer", action="store_false", dest="resume_optimizer")
+    parser.add_argument(
+        "--no_resume_optimizer", action="store_false", dest="resume_optimizer"
+    )
     parser.add_argument("--always_save_checkpoint", action="store_true", default=True)
     add_fp8_cli_args(parser, default_mode="auto")
     return parser
@@ -876,7 +1017,9 @@ def main():
 
     metadata_path = Path(args.feature_dir) / "metadata.json"
     if not metadata_path.exists():
-        raise FileNotFoundError(f"metadata.json missing in feature_dir: {metadata_path}")
+        raise FileNotFoundError(
+            f"metadata.json missing in feature_dir: {metadata_path}"
+        )
     with open(metadata_path, "r", encoding="utf-8") as f:
         metadata = json.load(f)
 
@@ -1024,12 +1167,22 @@ def main():
         except Exception as err:
             print(f"torch.compile failed, continuing without compile: {err}")
 
-    dtype_map = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
+    dtype_map = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }
     if args.dtype not in dtype_map:
         raise ValueError(f"Unsupported dtype {args.dtype}")
     ptdtype = dtype_map[args.dtype]
-    ctx = nullcontext() if device.type == "cpu" else torch.amp.autocast(device_type=device.type, dtype=ptdtype)
-    scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda" and args.dtype == "float16"))
+    ctx = (
+        nullcontext()
+        if device.type == "cpu"
+        else torch.amp.autocast(device_type=device.type, dtype=ptdtype)
+    )
+    scaler = torch.amp.GradScaler(
+        "cuda", enabled=(device.type == "cuda" and args.dtype == "float16")
+    )
 
     print(f"Train samples: {len(train_dataset)} | Val samples: {len(val_dataset)}")
     fp8_status = "enabled" if fp8_state.enabled else f"disabled ({fp8_state.reason})"
@@ -1070,7 +1223,9 @@ def main():
         current_lr = update_lr(args, optimizer, current_lr, iter_num)
 
         if iter_num > 0 and (iter_num % args.eval_interval == 0):
-            eval_stats = estimate_loss(model, train_loader, val_loader, args, ctx, device)
+            eval_stats = estimate_loss(
+                model, train_loader, val_loader, args, ctx, device
+            )
             if device.type == "cuda":
                 torch.cuda.empty_cache()
             print_eval(iter_num, eval_stats)
@@ -1080,12 +1235,16 @@ def main():
             metrics["val_acc"].append(eval_stats["val_accuracy"])
             metrics["eval_train_acc"].append(eval_stats["train_accuracy"])
 
-            should_save = eval_stats["val"] < best_val_loss or args.always_save_checkpoint
+            should_save = (
+                eval_stats["val"] < best_val_loss or args.always_save_checkpoint
+            )
             if eval_stats["val"] < best_val_loss:
                 best_val_loss = eval_stats["val"]
             if should_save:
                 ckpt_path = out_dir / args.save_name
-                save_checkpoint(model, optimizer, args, iter_num, best_val_loss, ckpt_path)
+                save_checkpoint(
+                    model, optimizer, args, iter_num, best_val_loss, ckpt_path
+                )
 
             plot_metrics(metrics, out_dir / args.metrics_name)
             if device.type == "cuda":
@@ -1142,10 +1301,16 @@ def main():
                 f"lr {current_lr:.6f}, {dt:.2f}ms"
             )
 
-        if device.type == "cuda" and args.log_memory_interval > 0 and iter_num % args.log_memory_interval == 0:
+        if (
+            device.type == "cuda"
+            and args.log_memory_interval > 0
+            and iter_num % args.log_memory_interval == 0
+        ):
             allocated_mb = torch.cuda.memory_allocated(device) / (1024.0 * 1024.0)
             peak_mb = torch.cuda.max_memory_allocated(device) / (1024.0 * 1024.0)
-            print(f"cuda_mem iter {iter_num}: allocated {allocated_mb:.1f} MiB, max_allocated {peak_mb:.1f} MiB")
+            print(
+                f"cuda_mem iter {iter_num}: allocated {allocated_mb:.1f} MiB, max_allocated {peak_mb:.1f} MiB"
+            )
 
         iter_num += 1
 
