@@ -1,9 +1,0 @@
-timestamp,config,seq,stride,status,eval_step,train_loss,val_loss,train_acc,val_acc,recall_w,recall_a,recall_s,recall_d,spec_w,spec_a,spec_s,spec_d,is_best_val_acc,is_best_val_loss,best_val_acc,best_val_acc_step,best_val_loss,best_val_loss_step,runtime_sec,avg_ms_per_iter,error
-2026-02-21T19:28:54,grid_s3_st5,3,5,failed,,,,,,,,,,,,,,False,False,,,,,81.15,,exit_code=1
-2026-02-21T19:30:28,grid_s3_st10,3,10,failed,,,,,,,,,,,,,,False,False,,,,,93.68,,exit_code=1
-2026-02-21T19:31:58,grid_s3_st20,3,20,failed,,,,,,,,,,,,,,False,False,,,,,89.86,,exit_code=1
-2026-02-21T19:33:27,grid_s5_st5,5,5,failed,,,,,,,,,,,,,,False,False,,,,,89.17,,exit_code=1
-2026-02-21T19:34:56,grid_s5_st10,5,10,failed,,,,,,,,,,,,,,False,False,,,,,88.82,,exit_code=1
-2026-02-21T19:36:22,grid_s5_st20,5,20,failed,,,,,,,,,,,,,,False,False,,,,,85.66,,exit_code=1
-2026-02-21T19:38:01,grid_s7_st5,7,5,failed,,,,,,,,,,,,,,False,False,,,,,99.08,,exit_code=1
-2026-02-21T19:39:28,grid_s7_st10,7,10,failed,,,,,,,,,,,,,,False,False,,,,,87.40,,exit_code=1
