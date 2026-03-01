@@ -98,7 +98,7 @@ class ChunkedRandomSampler(Sampler[int]):
 
 
 class AsyncBatchPrefetcher:
-    def __init__(self, loader, device: torch.device, prefetch_batches: int = 3, **_ignored):
+    def __init__(self, loader, device: torch.device, prefetch_batches: int = 2, **_ignored):
         self.loader = loader
         self.device = torch.device(device)
         self.prefetch_batches = max(int(prefetch_batches), 1)
@@ -719,6 +719,8 @@ def estimate_loss(model, train_loader, val_loader, args, ctx, device):
         out[f"{split}_per_class"] = per_class
 
     model.train()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
     return out
 
 
@@ -816,6 +818,7 @@ def create_arg_parser():
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--max_iters", type=int, default=5000)
     parser.add_argument("--log_interval", type=int, default=10)
+    parser.add_argument("--log_memory_interval", type=int, default=0)
     parser.add_argument("--eval_interval", type=int, default=500)
     parser.add_argument("--eval_iters", type=int, default=10)
 
@@ -840,7 +843,7 @@ def create_arg_parser():
 
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--prefetch_factor", type=int, default=2)
-    parser.add_argument("--async_prefetch_batches", type=int, default=3)
+    parser.add_argument("--async_prefetch_batches", type=int, default=2)
     parser.add_argument("--shuffle_chunk_size", type=int, default=4096)
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -1068,6 +1071,8 @@ def main():
 
         if iter_num > 0 and (iter_num % args.eval_interval == 0):
             eval_stats = estimate_loss(model, train_loader, val_loader, args, ctx, device)
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
             print_eval(iter_num, eval_stats)
 
             metrics["eval_iters"].append(iter_num)
@@ -1083,6 +1088,8 @@ def main():
                 save_checkpoint(model, optimizer, args, iter_num, best_val_loss, ckpt_path)
 
             plot_metrics(metrics, out_dir / args.metrics_name)
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
 
         loss_accum = 0.0
         logits_list = []
@@ -1108,6 +1115,7 @@ def main():
             logits_list.append(logits.detach().cpu())
             labels_list.append(y.detach().cpu())
             scaler.scale(loss).backward()
+            del loss, logits, x, y_dev
 
         if args.grad_clip > 0:
             scaler.unscale_(optimizer)
@@ -1120,6 +1128,7 @@ def main():
         logits_t = torch.cat(logits_list, dim=0)
         labels_t = torch.cat(labels_list, dim=0)
         train_acc = calc_accuracy(logits_t, labels_t, return_per_class=False)
+        del logits_t, labels_t, logits_list, labels_list
 
         metrics["iters"].append(iter_num)
         metrics["train_loss"].append(loss_accum)
@@ -1132,6 +1141,11 @@ def main():
                 f"iter {iter_num}: loss {loss_accum:.4f}, acc {train_acc * 100:.2f}%, "
                 f"lr {current_lr:.6f}, {dt:.2f}ms"
             )
+
+        if device.type == "cuda" and args.log_memory_interval > 0 and iter_num % args.log_memory_interval == 0:
+            allocated_mb = torch.cuda.memory_allocated(device) / (1024.0 * 1024.0)
+            peak_mb = torch.cuda.max_memory_allocated(device) / (1024.0 * 1024.0)
+            print(f"cuda_mem iter {iter_num}: allocated {allocated_mb:.1f} MiB, max_allocated {peak_mb:.1f} MiB")
 
         iter_num += 1
 
