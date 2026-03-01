@@ -179,10 +179,11 @@ def load_model(sample_only=False):
             model = Dinov3ForTimeSeriesClassification(
                 dino_size, len(id2label), dropout_rate=dropout_p, dtype=ptdtype,
                 cls_option=cls_option, num_heads=num_heads, num_layers=num_layers,
-                transformer_dim=transformer_dim, label_smoothing=label_smoothing
+                transformer_dim=transformer_dim, label_smoothing=label_smoothing,
+                max_frames=sequence_len
             )
         else:
-            model = Dinov2ForTimeSeriesClassification(dino_size, len(id2label), classifier_type=classifier_type, cls_option=cls_option, use_reg=use_dino_registers, dropout_rate=dropout_p)
+            model = Dinov2ForTimeSeriesClassification(dino_size, len(id2label), classifier_type=classifier_type, cls_option=cls_option, use_reg=use_dino_registers, dropout_rate=dropout_p, max_frames=sequence_len)
     elif init_from == 'resume':
         print(f"Resuming training from {out_dir}")
         ckpt_path = os.path.join(out_dir, load_checkpoint_name)
@@ -191,10 +192,11 @@ def load_model(sample_only=False):
             model = Dinov3ForTimeSeriesClassification(
                 dino_size, len(id2label), dropout_rate=dropout_p, dtype=ptdtype,
                 cls_option=cls_option, num_heads=num_heads, num_layers=num_layers,
-                transformer_dim=transformer_dim, label_smoothing=label_smoothing
+                transformer_dim=transformer_dim, label_smoothing=label_smoothing,
+                max_frames=sequence_len
             )
         else:
-            model = Dinov2ForTimeSeriesClassification(dino_size, len(id2label), classifier_type=classifier_type, cls_option=cls_option, use_reg=use_dino_registers, dropout_rate=dropout_p)
+            model = Dinov2ForTimeSeriesClassification(dino_size, len(id2label), classifier_type=classifier_type, cls_option=cls_option, use_reg=use_dino_registers, dropout_rate=dropout_p, max_frames=sequence_len)
         state_dict = checkpoint['model']
         print(checkpoint["config"])   # if you forgot your model setup lol
         # added back in from nanogpt, apparently torch compile adds this

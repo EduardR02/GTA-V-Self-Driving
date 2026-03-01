@@ -175,7 +175,7 @@ class EfficientTransformer(nn.Module):
         return self.norm(x)
 
 class Dinov2ForTimeSeriesClassification(nn.Module):
-    def __init__(self, size, num_classes, classifier_type, cls_option="patches_only", use_reg=True, dropout_rate=0.0, use_pos_weights=True):
+    def __init__(self, size, num_classes, classifier_type, cls_option="patches_only", use_reg=True, dropout_rate=0.0, use_pos_weights=True, max_frames=3):
         super().__init__()
         self.size = size
         self.num_classes = num_classes
@@ -189,7 +189,7 @@ class Dinov2ForTimeSeriesClassification(nn.Module):
         self.num_layers = 6
         # Calculate exact context length based on patches and frames
         self.patches_per_frame = 13 * 18  # 234 patches per frame
-        self.max_frames = 3
+        self.max_frames = max_frames
         # Determine transformer embedding dimension
         self.use_dino_embed_size = False
         self.transformer_dim = 48
@@ -323,13 +323,13 @@ class Dinov3ForTimeSeriesClassification(nn.Module):
     def __init__(self, size, num_classes, dropout_rate=0.0, 
                  repo_dir="dinov3", dtype=torch.bfloat16, cls_option="patches_only", 
                  use_transformers=False, use_pos_weights=True,
-                 num_heads=4, num_layers=2, transformer_dim=32, label_smoothing=0.0):
+                 num_heads=4, num_layers=2, transformer_dim=32, label_smoothing=0.0, max_frames=3):
         super().__init__()
         self.size = size
         self.num_classes = num_classes
         self.expected_input_hw = (192, 240) # 16x16 size patches
         self.dropout_rate = dropout_rate
-        self.max_frames = 3
+        self.max_frames = max_frames
         self.use_transformers = use_transformers
         self.cls_option = cls_option
         self.label_smoothing = label_smoothing
