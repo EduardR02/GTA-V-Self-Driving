@@ -41,7 +41,7 @@
 ## Training Loop
 - **Compilation:** use `torch.compile(model)` for throughput.
 - **LR schedule:** custom cosine with warmup via `get_lr()`.
-- **Invariant:** `lr_decay_iters` must always equal `max_iters`.
+- **LR schedule:** `lr_decay_iters` controls when cosine reaches `min_lr`. Can equal `max_iters` (full cosine) or be shorter (fast cosine — model trains at `min_lr` for the tail).
 - **Warm restarts:** `lr_restart_cycles` controls SGDR-style cosine restarts (`1` = standard cosine).
 - **AMP scaler:** enable `GradScaler` only for `float16`, never for `bfloat16`.
 
@@ -58,31 +58,49 @@
 - Prioritize high-signal experiments and keep negative results.
 - Require mechanism-level reasoning: explain why a change helped or hurt.
 
+## Decision Rule
+- Prioritize experiments that can falsify current hypotheses, not only confirm them.
+
 ## Non-Negotiable Guardrails
 - Preserve spawn-safe lazy memmap semantics.
 - Preserve `Muon` + `AdamW` split by parameter dimensionality.
 - Preserve base class weights exactly; allow multiplicative scaling only.
 - Keep `lr_decay_iters = max_iters` in every run/script.
+- **Exception:** fast cosine schedules intentionally use `lr_decay_iters < max_iters`.
 - Use `uv run python` for all execution.
 - Keep logs/checkpoints/plots in canonical directories.
 
-## Known Results (Mutable, Update As Experiments Progress)
-- Best architecture so far: `64d/6L` (`exp34`), `val_acc ~44.3%`, `S recall ~64%`, with signs of under-training.
-- Prior 10K runs (`exp41/exp42`) were misconfigured (`lr_decay_iters=5000`, `max_iters=10000`).
-- `A/D` steering ceiling around `~80/80` has persisted across many settings.
-- Failed interventions so far: focal loss, frame dropout, scheduled pos-weight, projection expansion to `256`, dropout `0.5`.
-- With `num_workers=4`, training is compute-bound.
-- Typical throughput for `64d/6L` + FP8 has been about `75-82 ms/iter`.
+## Current Hypotheses (Not Gospel)
+- These are working hypotheses from recent proxy runs and can be overturned by new seeds, longer training, or broader sweeps.
+- `64d/6L` (`exp34`) currently appears competitive (`val_acc ~44.3%`, `S recall ~64%`) and may still be under-trained.
+- Prior 10K runs (`exp41/exp42`) were misconfigured (`lr_decay_iters=5000`, `max_iters=10000`) and are lower-confidence evidence.
+- An `A/D` steering ceiling around `~80/80` currently appears common across many tested settings, pending more seeds.
+- Focal loss, frame dropout, scheduled pos-weight, projection expansion to `256`, and dropout `0.5` have not shown consistent gains so far.
+- With `num_workers=4`, training has typically been compute-bound on baseline hardware.
+- Typical throughput for `64d/6L` + FP8 has been about `75-82 ms/iter` in recent runs.
 
-### LR Schedule Discovery (exp46-61)
-- **S recall collapses with full cosine at 15K** — drops from ~50% at 5K to ~17% at 15K. Universal across all full-cosine runs.
-- **Fast cosine** (`lr_decay_iters` << `max_iters`) preserves S much better: LR decays to `min_lr` early, then model trains at low LR for the remaining iterations.
-- **Best S preservation**: short cosine (`lr_decay_iters=3000`) or fast cosine + `label_smoothing=0.01` — S stays ~50% throughout 15K with no collapse.
-- **Best val_acc**: fast cosine (`lr_decay_iters=5000`, `max_iters=15K-20K`) gives ~48-50% val_acc but S declines to ~33%.
-- **Pareto tradeoff**: higher val_acc ↔ lower S recall. Active cosine phase length controls where on this frontier.
-- Label smoothing alone (with full cosine) makes S collapse **worse**. LS only helps when combined with fast/short cosine.
-- Warm restarts (SGDR) did not prevent S collapse.
-- **Seed variance is massive**: S recall at 5K ranges 45-78% across seeds. Single-seed S comparisons with <15pt differences are noise.
-- **Eval fidelity matters**: `eval_iters=12` produced noisy S metrics. `eval_iters=50` gives much more stable readings.
-- Recommended proxy eval: always use `eval_iters ≥ 50`.
+### LR Schedule Trends (exp46-61)
+- `S` recall often declines with full cosine at 15K in observed runs (for example, from ~50% at 5K to ~17% at 15K), but this should be treated as provisional.
+- Fast cosine (`lr_decay_iters` << `max_iters`) currently appears likely to preserve `S` better by reaching `min_lr` earlier and training longer at low LR.
+- Best `S` preservation so far appears with short cosine (`lr_decay_iters=3000`) or fast cosine + `label_smoothing=0.01`, pending more seeds.
+- Best `val_acc` observed so far is with fast cosine (`lr_decay_iters=5000`, `max_iters=15K-20K`) around ~48-50%, often with lower `S` (~33%).
+- A Pareto-like tradeoff (higher `val_acc` vs lower `S` recall) currently appears likely; active cosine phase length seems to move runs along this frontier.
+- Label smoothing alone (with full cosine) has usually looked worse for `S`; it has looked more helpful when paired with fast/short cosine.
+- Warm restarts (SGDR) have not reliably prevented `S` decline in tested settings.
+- Seed variance appears large: `S` recall at 5K has ranged 45-78%; single-seed gaps under ~15 points are likely noise.
+- Eval fidelity matters: `eval_iters=12` looked noisier than `eval_iters=50`; default to `eval_iters >= 50` unless intentionally trading fidelity for speed.
 
+### Regularization Trends (exp62-73)
+- In the fast cosine regime, dropout `0.2` currently appears stronger than `0.35` (`exp66` vs `exp56`), but this remains seed-sensitive.
+- Dropout `0.1` has looked slightly weaker than `0.2` in current evidence.
+- Lower weight decay (`0.03` vs `0.075`) alone did not consistently help (`exp65`), though combinations may still be worth targeted retests.
+- Batch `512` (with 2x LR) currently appears to improve stability and slightly improve generalization in several runs.
+- `128`-dim (no downprojection) currently appears viable: `exp73` (incomplete at 13.5K) reached `A recall 90%`, `S recall 54%`, `D spec 78%`, with no obvious overfit yet.
+- `96`-dim underperformed `64`-dim in `exp72` (`val_acc 45.3%`), but this comparison is not definitive.
+- `8` layers did not clearly outperform `6` layers in current fast-cosine tests (`exp64` vs `exp66`).
+- `128`-dim + `bs512` has run at ~`190ms/iter` (vs ~`80ms` for `64d+bs256`, ~`130ms` for `64d+bs512`) on baseline hardware.
+
+### Current Candidate Configs
+- `64d/6L + drop=0.2 + fast cosine + bs512` currently looks like a strong baseline (`val_acc ~50-51%`, `A ~80/83`, `D ~84/72`, `S ~44-48%`, `W spec ~69-73%`).
+- `128-dim/6L + drop=0.2 + fast cosine` looks promising (`A recall 90%` observed once) and likely needs more bs512 + longer-run coverage.
+- Suggested default starting point (not mandatory): `eval_iters=50`, `batch_size=512`, `learning_rate=1e-4`, `muon_lr=0.003`.
