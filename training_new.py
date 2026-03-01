@@ -10,6 +10,7 @@ import math
 import time
 import psutil
 from tqdm import tqdm
+from fp8_utils import maybe_enable_fp8
 
 
 current_data_dirs = [config.stuck_data_dir_name, config.new_data_dir_name]  # has to be list
@@ -25,7 +26,7 @@ print(torch.version.cuda)
 out_dir = os.path.join('models', 'experiments')
 eval_interval = 1000
 log_interval = 10
-eval_iters = 10
+eval_iters = 50
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 fine_tune = False   # train the entire model or just the top
@@ -33,27 +34,27 @@ freeze_non_dino_layers = False
 init_from = 'resume' # 'scratch' or 'resume'
 dino_size = "base"  # small is ~21M, base ~86M, large ~300M, giant ~1.1B
 use_dino_registers = True
-load_checkpoint_name = "exp_2L128_25k_smooth.pt"
+load_checkpoint_name = ""
 save_checkpoint_name = "exp_2L128_25k_smooth.pt"
 metrics_name = "exp_2L128_25k_smooth_full.png"
-gradient_accumulation_steps = 1 # used to simulate larger batch sizes
+gradient_accumulation_steps = 2 # used to simulate larger batch sizes
 batch_size = 256    # if gradient_accumulation_steps > 1, this is the micro-batch size
 train_split = 0.95   # test val split, keep same for resume
 convert_to_greyscale = False
 sequence_len = 3
-sequence_stride = 10
+sequence_stride = 5
 flip_prob = 0.33
 warp_prob = 0.1
 zoom_prob = 0.3
-dropout_p = 0.25     # 0 to disable
+dropout_p = 0.2     # 0 to disable
 classifier_type = "bce" # "cce" or "bce"
 restart_schedules = False
 cls_option = "both"    # "cls_only", "both", or "patches_only"
 # Architecture (passed to model)
 transformer_dim = 128
-num_layers = 2
+num_layers = 6
 num_heads = 4
-label_smoothing = 0.05  # 0 to disable, 0.05 recommended
+label_smoothing = 0.0  # 0 to disable, 0.05 recommended
 shift_labels = True
 show_per_class_during_training = True
 
@@ -70,12 +71,13 @@ grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
 warmup_iters = 200 # how many steps to warm up for
-lr_decay_iters = 24000 # should be ~= max_iters per Chinchilla
+lr_decay_iters = 5000 # should be ~= max_iters per Chinchilla
 min_lr = 3e-6 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 # change this to bf16 if your gpu actually supports it
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
+fp8_mode = 'auto'
 compile = True # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
@@ -113,6 +115,7 @@ iter_num = 0
 best_val_loss = 1e9
 iter_num_on_load = 0
 model = optimizer = scaler = None
+fp8_state = None
 
 
 # claude wrote a quick check to see if there are any conversion issues, after taking a look i decided to inference in fp16 for 60% more fps
@@ -164,9 +167,12 @@ def check_fp16_conversion_issues(model):
 
 
 def load_model(sample_only=False):
-    global model, optimizer, scaler, iter_num, best_val_loss, iter_num_on_load, init_from
+    global model, optimizer, scaler, fp8_state, iter_num, best_val_loss, iter_num_on_load, init_from
     checkpoint = None
     init_from = 'resume' if sample_only else init_from
+    if init_from == 'resume' and not load_checkpoint_name:
+        print("No checkpoint name provided, initializing from scratch")
+        init_from = 'scratch'
     if init_from == 'scratch':
         print("Initializing a new model from scratch")
         if config.use_dinov3:
@@ -231,6 +237,13 @@ def load_model(sample_only=False):
     print(sum(p.numel() for p in model.parameters() if p.requires_grad))
 
     model.to(device)
+
+    model, fp8_state = maybe_enable_fp8(
+        model,
+        mode=fp8_mode,
+        use_dinov3=True,
+        device=device,
+    )
 
     # initialize a GradScaler. If enabled=False scaler is a no-op
     scaler = torch.amp.GradScaler('cuda', enabled=(dtype == 'float16'))
@@ -639,7 +652,7 @@ def _collect_evaluation_metrics(losses_and_accs, metrics_dict, local_iter_num):
     metrics_dict["val_class_metrics"].append(val_per_class)
 
 def train_loop():
-    global iter_num, best_val_loss, num_workers
+    global iter_num, best_val_loss, num_workers, fp8_state
     num_workers = 4
     t0 = time.time()
     init_dataloaders()
@@ -648,6 +661,17 @@ def train_loop():
     print("Total train samples:", len(train_dataloader.dataset))
     print("Total val samples:", len(val_dataloader.dataset))
     model = load_model()
+    fp8_status = "enabled" if fp8_state.enabled else f"disabled ({fp8_state.reason})"
+    if fp8_state.enabled and fp8_state.recipe is not None:
+        fp8_status = f"enabled:{fp8_state.recipe}"
+    print(
+        ", ".join([
+            f"device={device}",
+            f"dtype={dtype}",
+            f"fp8={fp8_status}",
+            f"label_smoothing={label_smoothing}",
+        ])
+    )
     dataloader_iter = iter(train_dataloader)
     X, Y, Y_CPU, dataloader_iter = get_batch(dataloader_iter, 'train')
     # Cache learning rate to avoid recalculation
