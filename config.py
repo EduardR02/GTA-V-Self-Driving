@@ -3,7 +3,7 @@ import os
 width = 240
 height = 180
 sequence_len = 3
-sequence_stride = 10     # Period between successive output sequences
+sequence_stride = 5     # Period between successive output sequences
 fps_at_recording_time = 80      # check by using main with fps only set to true, while having the game running
 fps_at_test_time = 39    # check by running model in main, while game is running!
 use_dinov3 = True
